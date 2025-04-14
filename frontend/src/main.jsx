@@ -1,16 +1,24 @@
-import React from 'react'
-import ReactDOM from 'react-dom/client'
-import App from './App'
-// Optional: Import global CSS if needed, but ChakraProvider handles resets
-// import './index.css'
+// File: frontend/src/main.jsx
+import React from 'react';
+import ReactDOM from 'react-dom/client'; // Use client import for React 18+
+import App from './App';
+// Optional: If you have global CSS not handled by Chakra, import it here
+// import './index.css';
 
+// Find the root element in your index.html
 const rootElement = document.getElementById('root');
+
+// Ensure the root element exists before trying to render
 if (rootElement) {
-    ReactDOM.createRoot(rootElement).render(
+    // Create a root instance
+    const root = ReactDOM.createRoot(rootElement);
+    // Render the App component within StrictMode for development checks
+    root.render(
         <React.StrictMode>
             <App />
         </React.StrictMode>,
     );
 } else {
-    console.error("Failed to find the root element. Ensure there's an element with id='root' in your index.html.");
+    // Log an error if the root element is missing
+    console.error("Fatal Error: Root element with id 'root' not found in index.html. React app cannot be mounted.");
 }

@@ -38,3 +38,4 @@ pgadmin_data/
 # AI Model Cache (Examples - adjust if needed)
 # ~/.cache/huggingface/
 # ~/.cache/torch/
+.env.production
