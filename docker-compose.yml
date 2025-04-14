@@ -1,124 +1,138 @@
-version: '3.8' # Use a recent version
+# File: docker-compose.yml (in project root: omnicore-ai-platform/)
+# Single file used for both dev and prod, adapted via .env files and commenting volumes
 
 services:
   # --- Database Service (PostgreSQL) ---
   db:
-    image: postgres:15-alpine # Use a specific version (e.g., 15) on Alpine for size
-    container_name: omnicore_db # Explicit container name
+    image: postgres:15-alpine # Specific image version
+    container_name: omnicore_db
     volumes:
-      # Mount a named volume for persistent data
+      # Named volume for persistent data (Keep for Dev & Prod)
       - postgres_data:/var/lib/postgresql/data/
     env_file:
-      - .env # Load POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+      # Load DB credentials from specified .env file (.env or .env.production)
+      - .env
     networks:
-      - app-network # Connect to the custom network
-    restart: unless-stopped # Keep DB running unless manually stopped
-    healthcheck: # Check if DB is ready before others start
+      - app-network
+    restart: unless-stopped # Keep DB running
+    healthcheck: # Ensure DB is ready before dependent services start
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
     expose:
-      # Expose port only within the Docker network (no host mapping needed usually)
+      # Expose port only within the Docker network
       - "5432"
 
   # --- Database Admin Tool (PgAdmin) ---
   pgadmin:
-    image: dpage/pgadmin4:latest # Use official image
+    image: dpage/pgadmin4:latest
     container_name: omnicore_pgadmin
     env_file:
-      - .env # Load PGADMIN_DEFAULT_EMAIL, PGADMIN_DEFAULT_PASSWORD
+      # Load PgAdmin credentials from specified .env file
+      - .env
     ports:
-      # Map host port 5050 to container port 80 (PgAdmin default)
+      # Map host port 5050 to container port 80 (Keep for Dev & Prod)
       - "5050:80"
     volumes:
-      - pgadmin_data:/var/lib/pgadmin # Persist PgAdmin servers/settings
+      # Persist PgAdmin data (Keep for Dev & Prod)
+      - pgadmin_data:/var/lib/pgadmin
     networks:
       - app-network
     depends_on:
-      db: # Wait for DB to be healthy before starting PgAdmin
+      db: # Wait for DB to be healthy
         condition: service_healthy
     restart: unless-stopped
 
   # --- Backend Service (Django) ---
   backend:
     build:
-      context: ./backend # Path to directory containing Dockerfile
-      dockerfile: Dockerfile
+      context: ./backend # Correct path to backend folder
+      dockerfile: Dockerfile # Assumes Dockerfile is named 'Dockerfile'
     container_name: omnicore_backend
-    # Command is now specified in the Dockerfile's CMD instruction
+    # Command is specified in the backend/Dockerfile CMD instruction
     volumes:
-      # Mount code for development (hot-reloading for Python may need extra setup)
-      # Comment out or remove for production image builds
+      # === DEV vs PROD CHANGE ===
+      # FOR DEVELOPMENT: Mount local code folder to /app inside container.
       - ./backend:/app
-      # !!! Mount Docker socket - MAJOR SECURITY RISK in production !!!
-      # Only for this specific PoC - REMOVE for any real deployment
+      # FOR PRODUCTION: Comment out or REMOVE the above line.
+
+      # === DEV vs PROD CHANGE (PoC Specific & Security) ===
+      # FOR DEVELOPMENT PoC ONLY: Mount Docker socket (SECURITY RISK).
       - /var/run/docker.sock:/var/run/docker.sock
+      # FOR PRODUCTION: Comment out or REMOVE the above line COMPLETELY.
     env_file:
-      - .env # Loads DJANGO_*, DATABASE_URL, STT_CONTAINER_NAME etc.
+      # Load Django settings, DB URL, etc., from specified .env file
+      - .env
     networks:
       - app-network
     depends_on:
-      db: # Wait for DB to be healthy before starting
+      db: # Wait for DB to be healthy
         condition: service_healthy
-      # depends_on does not guarantee service readiness, only existence/started
-      # stt_service: # No explicit depends_on needed if backend handles service being down
-    restart: unless-stopped # Keep controller running
+      # No explicit depends_on stt_service needed if backend handles its status via API
+    restart: unless-stopped # Keep the backend controller running
     expose:
-      # Expose port only within the Docker network (Nginx will proxy)
-      - "8000"
+      # Expose backend port only within the Docker network (Nginx proxies to this)
+      - "${BACKEND_SERVICE_PORT:-8000}" # Use port from .env or default
 
   # --- AI Service (STT - FastAPI) ---
   stt_service:
     build:
-      context: ./ai_services/stt_service
-      dockerfile: Dockerfile
-    container_name: ${STT_CONTAINER_NAME:-omnicore_stt_service_container} # Use value from .env or default
-    # Command specified in Dockerfile CMD
+      context: ./ai_services/stt_service # Correct path
+      dockerfile: Dockerfile # Assumes Dockerfile is named 'Dockerfile'
+    container_name: ${STT_CONTAINER_NAME:-omnicore_stt_service_container_dev} # Name from .env
+    # Command specified in ai_services/stt_service/Dockerfile CMD
     volumes:
-      # Mount code for development
-      # Comment out or remove for production image builds
+      # === DEV vs PROD CHANGE ===
+      # FOR DEVELOPMENT: Mount local code folder.
       - ./ai_services/stt_service:/app
-      # Add volume mounts for model caches if needed and not baked into image
-      # - stt_models:/root/.cache/huggingface # Example
+      # FOR PRODUCTION: Comment out or REMOVE the above line.
+
+      # Optional: Mount persistent cache for AI models if needed
+      # - stt_models:/root/.cache/huggingface
     env_file:
+      # Loads STT_SERVICE_PORT, etc., from specified .env file
       - .env
     networks:
       - app-network
-    restart: "no" # Explicit control via API for this PoC
-    stop_grace_period: 15s # Allow time for graceful shutdown in main.py
+    # === DEV vs PROD CHANGE (Behavior) ===
+    # FOR DEVELOPMENT PoC: Explicit control via API
+    restart: "no"
+    # FOR PRODUCTION: Change to 'unless-stopped' if service should always run
+    # restart: unless-stopped
+    stop_grace_period: 15s # Allow time for graceful shutdown
     expose:
-      # Expose port only within Docker network (accessed by backend)
-      - "${STT_SERVICE_PORT:-8001}" # Use port from .env
+      # Expose STT port only within Docker network (accessed by backend)
+      - "${STT_SERVICE_PORT:-8001}" # Port from .env
 
   # --- Frontend Service (React served by Nginx) ---
   frontend:
     build:
-      context: ./frontend # Specifies the build context directory
-      dockerfile: Dockerfile # Specifies the Dockerfile within that context
+      context: ./frontend # Correct path to frontend folder
+      dockerfile: Dockerfile # Assumes Dockerfile is named 'Dockerfile'
     container_name: omnicore_frontend
     ports:
       # Map host port (from .env or default 5173) to container port 80 (Nginx)
-      - "${FRONTEND_PORT:-5173}:80"
+      - "${FRONTEND_PORT:-5174}:80"
     networks:
       - app-network
     depends_on:
-      - backend # Ensure backend is started before frontend (for API proxy)
-    restart: unless-stopped
+      - backend # Nginx needs backend service available for API proxying
+    restart: unless-stopped # Keep frontend running
 
 # --- Networks ---
+# Define a custom bridge network allowing services to communicate by name
 networks:
   app-network:
-    driver: bridge # Default Docker network driver
+    driver: bridge
 
 # --- Volumes ---
-# Define named volumes for persistent data
+# Define named volumes for persistent data (KEEP FOR BOTH DEV & PROD)
 volumes:
   postgres_data:
-    driver: local
+    driver: local # Use default local driver
   pgadmin_data:
     driver: local
-  # Add volumes for AI models if needed
+  # Define model cache volume if used above
   # stt_models:
   #   driver: local
-
