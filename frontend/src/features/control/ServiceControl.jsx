@@ -11,106 +11,137 @@ import {
   VStack,
   Heading,
   useInterval, // Chakra hook for intervals
+  Alert,
+  AlertIcon,
+  AlertTitle,
+  AlertDescription,
+  CloseButton,
 } from '@chakra-ui/react';
 
 function ServiceControl({ serviceName = 'stt', title = 'STT Service Control' }) {
   const [status, setStatus] = useState('loading'); // 'loading', 'running', 'exited', 'created', 'error', 'unknown', 'not_found'
   const [isActionLoading, setIsActionLoading] = useState(false); // Loading state specifically for button actions
+  const [lastError, setLastError] = useState(null); // Store last error message
   const toast = useToast();
   const isMounted = useRef(true); // Ref to track component mount status
+  const toastIdRef = useRef(); // Ref to manage toast IDs
+
+  // Function to safely close existing toast
+  const closeToast = () => {
+    if (toastIdRef.current) {
+      toast.close(toastIdRef.current);
+    }
+  }
+
+  // Function to show toast notifications
+  const showToast = (id, title, description, status) => {
+    closeToast(); // Close previous toast before showing new one
+    toastIdRef.current = toast({
+      id: id, // Use id to prevent duplicates if needed rapidly
+      title: title,
+      description: description,
+      status: status, // 'success', 'error', 'warning', 'info'
+      duration: status === 'error' ? 8000 : 4000, // Longer duration for errors
+      isClosable: true,
+      position: 'top-right', // Or other position
+    });
+  }
 
   // Callback to fetch status safely
-  const fetchStatus = useCallback(async () => {
-    // Prevent fetching if an action is in progress or component unmounted
+  const fetchStatus = useCallback(async (isInitial = false) => {
     if (isActionLoading || !isMounted.current) return;
 
-    // console.log(); // Debug log
+    if (!isInitial) {
+      // console.log(`Polling status for ${serviceName}...`); // Debug log
+    } else {
+      console.log(`Initial status fetch for ${serviceName}...`);
+    }
+
     try {
       const response = await getServiceStatus(serviceName);
-      if (isMounted.current) { // Check if component is still mounted before setting state
-          setStatus(response.data.status || 'unknown');
+      if (isMounted.current) {
+        const newStatus = response.data.status || 'unknown';
+        if (newStatus !== status) { // Only update state if status changed
+          console.log(`Status changed for ${serviceName}: ${status} -> ${newStatus}`);
+          setStatus(newStatus);
+          setLastError(null); // Clear error on successful status update
+        }
       }
     } catch (error) {
       console.error('Error fetching status:', error.response || error.message);
+      const errorMsg = error.response?.data?.error || error.message;
       if (isMounted.current) {
-          setStatus('error');
-          // Show toast only once on error, not on every poll failure potentially
-          if (status !== 'error') { // Only show toast if status wasn't already error
-              toast({
-                id: , // Prevent duplicate toasts
-                title: 'Error fetching status',
-                description: `Could not get status for ${serviceName}: ${error.response?.data?.error || error.message}`,
-                status: 'error',
-                duration: 5000,
-                isClosable: true,
-              });
-          }
+        setStatus('error');
+        setLastError(errorMsg); // Store the error message
+        // Only show toast on initial fetch failure or if status wasn't already error
+        if (isInitial || status !== 'error') {
+          showToast(`status-error-${serviceName}`, 'Error Fetching Status', errorMsg, 'error');
+        }
       }
     }
-  }, [serviceName, isActionLoading, toast, status]); // status added to prevent redundant error toasts
+  }, [serviceName, isActionLoading, toast, status]); // Include status
 
   // Fetch status on initial mount
   useEffect(() => {
     isMounted.current = true;
-    fetchStatus();
+    fetchStatus(true); // Pass true for initial fetch
 
-    // Cleanup function to set isMounted to false when component unmounts
+    // Cleanup function
     return () => {
       isMounted.current = false;
+      closeToast(); // Close any active toast on unmount
     };
-  }, [fetchStatus]); // Run only once on mount
+  }, []); // Empty dependency array ensures this runs only once on mount
 
-  // Use Chakra's interval hook for polling
-  useInterval(fetchStatus, status === 'loading' || isActionLoading ? null : 5000); // Poll every 5s unless an action is happening
+  // Use Chakra's interval hook for polling (only if component is mounted)
+  useInterval(() => {
+    if (isMounted.current) {
+      fetchStatus(false); // Pass false for poll fetches
+    }
+  }, status === 'loading' || isActionLoading ? null : 5000); // Poll every 5s unless action/loading
+
 
   // Handler for start/stop actions
   const handleControl = async (action) => {
-    if (!isMounted.current) return; // Prevent action if component unmounted
+    if (!isMounted.current) return;
 
     setIsActionLoading(true);
     setStatus('loading'); // Indicate action in progress
+    setLastError(null); // Clear previous errors
+    closeToast(); // Close any lingering status toasts
 
     const actionVerb = action === 'start' ? 'Starting' : 'Stopping';
     const actionFunc = action === 'start' ? startService : stopService;
+    const toastId = `action-${action}-${serviceName}-${Date.now()}`; // Unique ID
 
     try {
       const response = await actionFunc(serviceName);
       if (isMounted.current) {
-        setStatus(response.data.status || 'unknown');
-        toast({
-          id: ,
-          title: `Service  requested`,
-          description: response.data.message || `${actionVerb} request sent.`,
-          status: 'success',
-          duration: 3000,
-          isClosable: true,
-        });
+        const finalStatus = response.data.status || 'unknown';
+        setStatus(finalStatus); // Update status based on response
+        showToast(toastId, `Service ${action} requested`, response.data.message || `${actionVerb} request sent. Final status: ${finalStatus}`, 'success');
       }
     } catch (error) {
-      console.error(`Error ing service:`, error.response || error.message);
+      console.error(`Error ${action}ing service:`, error.response || error.message);
+      const errorMsg = error.response?.data?.error || error.message;
       if (isMounted.current) {
         setStatus('error'); // Set status to error on failure
-        toast({
-          id: ,
-          title: `Failed to  service`,
-          description: error.response?.data?.error || error.message,
-          status: 'error',
-          duration: 5000,
-          isClosable: true,
-        });
-        // Fetch status again after error to get actual state
-        fetchStatus();
+        setLastError(errorMsg);
+        showToast(toastId, `Failed to ${action} service`, errorMsg, 'error');
+        // Fetch status again after error to be sure
+        fetchStatus(false);
       }
     } finally {
-        // Short delay before re-enabling buttons to allow status to potentially update
-        if (isMounted.current) {
-            setTimeout(() => setIsActionLoading(false), 1000);
-        }
+      if (isMounted.current) {
+        // Delay slightly before re-enabling buttons
+        setTimeout(() => setIsActionLoading(false), 1000);
+      }
     }
   };
 
-  // Helper to determine badge color based on status
+  // Helper to determine badge color
   const getStatusColorScheme = () => {
+    // ... (Switch statement as in previous example: running=green, exited/created=gray, error/not_found=red, loading=yellow, default=blue)
     switch (status) {
       case 'running': return 'green';
       case 'exited':
@@ -122,46 +153,60 @@ function ServiceControl({ serviceName = 'stt', title = 'STT Service Control' }) 
     }
   };
 
-  const isStartDisabled = isActionLoading || status === 'running' || status === 'loading' || status === 'error' || status === 'not_found';
-  const isStopDisabled = isActionLoading || status !== 'running' || status === 'loading';
+  // Determine button disabled states
+  const isStartDisabled = isActionLoading || ['running', 'loading', 'error', 'not_found'].includes(status);
+  const isStopDisabled = isActionLoading || !['running'].includes(status);
 
   return (
-    <Box p={5} borderWidth="1px" borderRadius="lg" shadow="md">
-      <VStack spacing={4} align="stretch">
-        <HStack justify="space-between">
-          <Heading size="md">{title}</Heading>
-          {status === 'loading' && !isActionLoading ? (
-              <Spinner size="sm" />
-          ) : (
-              <Badge fontSize="0.9em" px={3} py={1} borderRadius="full" colorScheme={getStatusColorScheme()}>
-                  {status}
-              </Badge>
+      <Box p={5} borderWidth="1px" borderRadius="lg" shadow="md" bg="white">
+        <VStack spacing={4} align="stretch">
+          <HStack justify="space-between">
+            <Heading size="md">{title}</Heading>
+            <Badge fontSize="0.9em" px={3} py={1} borderRadius="full" variant='solid' colorScheme={getStatusColorScheme()}>
+              {isActionLoading ? 'Processing...' : status}
+            </Badge>
+          </HStack>
+
+          {lastError && status === 'error' && (
+              <Alert status='error' variant='subtle' flexDirection='column' alignItems='center' justifyContent='center' textAlign='center' borderRadius="md">
+                <AlertIcon boxSize='30px' mr={0}/>
+                <AlertTitle mt={2} mb={1} fontSize='lg'>
+                  Action/Status Error!
+                </AlertTitle>
+                <AlertDescription maxWidth='sm'>
+                  {lastError}
+                </AlertDescription>
+                <CloseButton alignSelf='flex-start' position='relative' right={-1} top={-1} onClick={() => setLastError(null)} />
+              </Alert>
           )}
-        </HStack>
-        <HStack mt={2} justify="center">
-          <Button
-            colorScheme="green"
-            onClick={() => handleControl('start')}
-            isLoading={isActionLoading && status === 'loading'} // Show spinner only during direct action
-            isDisabled={isStartDisabled}
-            minW="100px"
-          >
-            Start
-          </Button>
-          <Button
-            colorScheme="red"
-            onClick={() => handleControl('stop')}
-            isLoading={isActionLoading && status === 'loading'} // Show spinner only during direct action
-            isDisabled={isStopDisabled}
-            minW="100px"
-          >
-            Stop
-          </Button>
-        </HStack>
-      </VStack>
-    </Box>
+
+          <HStack mt={2} justify="space-around">
+            <Button
+                leftIcon={isActionLoading && status === 'loading' ? <Spinner size="sm" /> : undefined}
+                colorScheme="green"
+                variant="solid"
+                onClick={() => handleControl('start')}
+                isLoading={isActionLoading} // Let Chakra handle spinner via isLoading
+                isDisabled={isStartDisabled}
+                minW="120px"
+            >
+              Start Service
+            </Button>
+            <Button
+                leftIcon={isActionLoading && status === 'loading' ? <Spinner size="sm" /> : undefined}
+                colorScheme="red"
+                variant="solid"
+                onClick={() => handleControl('stop')}
+                isLoading={isActionLoading}
+                isDisabled={isStopDisabled}
+                minW="120px"
+            >
+              Stop Service
+            </Button>
+          </HStack>
+        </VStack>
+      </Box>
   );
 }
 
 export default ServiceControl;
-

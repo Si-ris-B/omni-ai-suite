@@ -1,37 +1,47 @@
 import axios from 'axios';
 
-// Base URL for our backend API, proxied by Nginx in production/docker
+// Base URL for backend API (proxied by Nginx)
 const API_BASE_URL = '/api';
 
+// Create configured Axios instance
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
+  timeout: 10000, // Add a reasonable timeout (e.g., 10 seconds)
   headers: {
     'Content-Type': 'application/json',
-    // Add other default headers if needed
+    // Add Accept header if needed by DRF content negotiation
+    Accept: 'application/json',
   },
 });
 
-// Function to get service status
+// --- Control API Functions ---
 export const getServiceStatus = (serviceName) => {
+  console.log(`API Call: GET /control/status/${serviceName}/`);
   return apiClient.get(`/control/status/${serviceName}/`);
 };
 
-// Function to start a service
 export const startService = (serviceName) => {
-  // POST request, even if no body is needed for this specific action
+  console.log(`API Call: POST /control/start/${serviceName}/`);
   return apiClient.post(`/control/start/${serviceName}/`);
 };
 
-// Function to stop a service
 export const stopService = (serviceName) => {
+  console.log(`API Call: POST /control/stop/${serviceName}/`);
   return apiClient.post(`/control/stop/${serviceName}/`);
 };
 
-// Add other API functions here later (e.g., for STT uploads)
-// export const uploadAudioForSTT = (formData) => {
-//   return apiClient.post('/stt/upload/', formData, {
-//     headers: { 'Content-Type': 'multipart/form-data' },
-//   });
-// };
+// --- STT API Functions (Placeholder for later) ---
+export const uploadAudioForSTT = (formData) => {
+  console.log('API Call: POST /stt/upload/ with FormData');
+  return apiClient.post('/stt/upload/', formData, {
+    // Assuming Django URL is /api/stt/upload/
+    headers: {
+      // Let Axios set Content-Type for FormData automatically
+      'Content-Type': 'multipart/form-data',
+    },
+    timeout: 60000, // Longer timeout for potential file uploads
+  });
+};
 
-export default apiClient; // Export configured instance if needed elsewhere
+// Export the configured instance if needed elsewhere
+export default apiClient;
