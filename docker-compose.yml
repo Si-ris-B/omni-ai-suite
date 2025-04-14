@@ -1,0 +1,124 @@
+version: '3.8' # Use a recent version
+
+services:
+  # --- Database Service (PostgreSQL) ---
+  db:
+    image: postgres:15-alpine # Use a specific version (e.g., 15) on Alpine for size
+    container_name: omnicore_db # Explicit container name
+    volumes:
+      # Mount a named volume for persistent data
+      - postgres_data:/var/lib/postgresql/data/
+    env_file:
+      - .env # Load POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+    networks:
+      - app-network # Connect to the custom network
+    restart: unless-stopped # Keep DB running unless manually stopped
+    healthcheck: # Check if DB is ready before others start
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    expose:
+      # Expose port only within the Docker network (no host mapping needed usually)
+      - "5432"
+
+  # --- Database Admin Tool (PgAdmin) ---
+  pgadmin:
+    image: dpage/pgadmin4:latest # Use official image
+    container_name: omnicore_pgadmin
+    env_file:
+      - .env # Load PGADMIN_DEFAULT_EMAIL, PGADMIN_DEFAULT_PASSWORD
+    ports:
+      # Map host port 5050 to container port 80 (PgAdmin default)
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin # Persist PgAdmin servers/settings
+    networks:
+      - app-network
+    depends_on:
+      db: # Wait for DB to be healthy before starting PgAdmin
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Backend Service (Django) ---
+  backend:
+    build:
+      context: ./backend # Path to directory containing Dockerfile
+      dockerfile: Dockerfile
+    container_name: omnicore_backend
+    # Command is now specified in the Dockerfile's CMD instruction
+    volumes:
+      # Mount code for development (hot-reloading for Python may need extra setup)
+      # Comment out or remove for production image builds
+      - ./backend:/app
+      # !!! Mount Docker socket - MAJOR SECURITY RISK in production !!!
+      # Only for this specific PoC - REMOVE for any real deployment
+      - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env # Loads DJANGO_*, DATABASE_URL, STT_CONTAINER_NAME etc.
+    networks:
+      - app-network
+    depends_on:
+      db: # Wait for DB to be healthy before starting
+        condition: service_healthy
+      # depends_on does not guarantee service readiness, only existence/started
+      # stt_service: # No explicit depends_on needed if backend handles service being down
+    restart: unless-stopped # Keep controller running
+    expose:
+      # Expose port only within the Docker network (Nginx will proxy)
+      - "8000"
+
+  # --- AI Service (STT - FastAPI) ---
+  stt_service:
+    build:
+      context: ./ai_services/stt_service
+      dockerfile: Dockerfile
+    container_name: ${STT_CONTAINER_NAME:-omnicore_stt_service_container} # Use value from .env or default
+    # Command specified in Dockerfile CMD
+    volumes:
+      # Mount code for development
+      # Comment out or remove for production image builds
+      - ./ai_services/stt_service:/app
+      # Add volume mounts for model caches if needed and not baked into image
+      # - stt_models:/root/.cache/huggingface # Example
+    env_file:
+      - .env
+    networks:
+      - app-network
+    restart: "no" # Explicit control via API for this PoC
+    stop_grace_period: 15s # Allow time for graceful shutdown in main.py
+    expose:
+      # Expose port only within Docker network (accessed by backend)
+      - "${STT_SERVICE_PORT:-8001}" # Use port from .env
+
+  # --- Frontend Service (React served by Nginx) ---
+  frontend:
+    build:
+      context: ./frontend # Specifies the build context directory
+      dockerfile: Dockerfile # Specifies the Dockerfile within that context
+    container_name: omnicore_frontend
+    ports:
+      # Map host port (from .env or default 5173) to container port 80 (Nginx)
+      - "${FRONTEND_PORT:-5173}:80"
+    networks:
+      - app-network
+    depends_on:
+      - backend # Ensure backend is started before frontend (for API proxy)
+    restart: unless-stopped
+
+# --- Networks ---
+networks:
+  app-network:
+    driver: bridge # Default Docker network driver
+
+# --- Volumes ---
+# Define named volumes for persistent data
+volumes:
+  postgres_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+  # Add volumes for AI models if needed
+  # stt_models:
+  #   driver: local
+
