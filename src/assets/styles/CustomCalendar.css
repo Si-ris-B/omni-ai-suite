@@ -1,0 +1,24 @@
+/* File: CustomCalendar.css */
+
+/* This rule is now more specific, so it will win. */
+.ant-picker-calendar .ant-picker-cell-inner {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.events {
+    flex-grow: 1;
+    overflow-y: auto;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.events .ant-badge-status-text {
+    width: 90%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 12px;
+}

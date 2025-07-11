@@ -1,0 +1,12 @@
+# Ignore artifacts:
+build
+dist
+coverage
+node_modules
+
+# Ignore lock files if you don't want them formatted
+package-lock.json
+yarn.lock
+
+# Ignore specific files if needed
+# public/some-generated-file.js
