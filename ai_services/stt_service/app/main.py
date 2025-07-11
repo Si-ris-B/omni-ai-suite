@@ -1,728 +1,697 @@
-# main.py
+# stt_service_project/app/main.py
 import os
 import time
 import asyncio
 import json
 import traceback
 import gc
-from typing import Optional, List, Union,  Iterable,  Dict
+from typing import Optional, List, Union, Iterable, Dict, Tuple
 from pathlib import Path
 
 # --- FastAPI and Related Imports ---
 from fastapi import (
     FastAPI, HTTPException, Body, status, WebSocket, WebSocketDisconnect
 )
-# from fastapi.security.api_key import APIKeyHeader # REMOVED
 from fastapi.responses import StreamingResponse, JSONResponse
 
 # --- Faster Whisper Imports ---
-# REMOVED VadOptions from this import
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from faster_whisper.audio import decode_audio
-# from faster_whisper.tokenizer import Tokenizer # Needed for suppress_tokens=-1
+# from faster_whisper.tokenizer import Tokenizer # Conditionally imported
 
 # --- Pydantic for Validation ---
 from pydantic import BaseModel, Field
 import numpy as np
 
 # --- Logging Setup ---
-from logging_config import setup_logging,  log_websockets # Import necessary items
-logger = None # Will be initialized in startup
+APP_LOGGER_NAME = "stt_service.main"  # Define before importing logging_config
+from logging_config import setup_logging, log_websockets
+
+logger = None  # Will be initialized in startup
 
 # --- Global State Variables ---
 current_model: Optional[WhisperModel] = None
-current_config: Optional[Dict] = None
+current_config: Optional[Dict] = None  # Store the dict version of ModelConfigParams
 current_batched_pipeline: Optional[BatchedInferencePipeline] = None
-model_lock = asyncio.Lock() # Lock to protect loading/unloading/accessing model state
+model_lock = asyncio.Lock()
 
-# --- Configuration Paths (from Environment or Defaults) ---
-SHARED_AUDIO_PATH = Path(os.getenv("SHARED_AUDIO_PATH", "/shared_audio"))
-MODEL_CACHE_PATH = Path(os.getenv("MODEL_CACHE_PATH", "/models"))
+# --- FIXED INTERNAL Configuration Paths ---
+# These are fixed from the application's perspective INSIDE the container.
+# Dynamism comes from what HOST directories are mounted TO these locations via `docker run -v`.
+SHARED_AUDIO_PATH = Path("/stt_app_data/audio_inbox")
+MODEL_CACHE_PATH = Path("/stt_app_data/model_cache")
 
-# --- API Key Configuration & Dependency REMOVED ---
+# --- Environment Variables for other settings ---
+ENV_LOG_LEVEL = "LOG_LEVEL"
+ENV_CLEANUP_AUDIO = "CLEANUP_AUDIO"
+ENV_APP_PORT = "PORT"  # For Uvicorn, matches Dockerfile and run commands
+ENV_APP_HOST = "HOST"  # For Uvicorn
 
-# --- Pydantic Models (Unchanged Structurally) ---
+LOG_LEVEL = os.getenv(ENV_LOG_LEVEL, "INFO")
+SHOULD_CLEANUP_AUDIO = os.getenv(ENV_CLEANUP_AUDIO, "True").lower() == "true"
+APP_PORT = int(os.getenv(ENV_APP_PORT, "8001"))  # Default internal port
+APP_HOST = os.getenv(ENV_APP_HOST, "0.0.0.0")
+
+
+# --- Pydantic Models ---
 class ModelConfigParams(BaseModel):
-    model_size_or_path: str = Field(..., description="Model name, HF ID, or local path")
-    device: str = Field("cpu")
-    compute_type: str = Field("default")
-    device_index: Union[int, List[int]] = Field(0)
-    cpu_threads: int = Field(0)
-    num_workers: int = Field(1)
+    model_size_or_path: str = Field(...,
+                                    description="Model name (e.g., 'base.en'), HuggingFace ID, or path to a converted model directory (can be relative to STT_MODEL_CACHE_PATH or absolute inside container).")
+    device: str = Field("auto", description="Device: 'cpu', 'cuda', 'auto'.")
+    compute_type: str = Field("default", description="Compute type: e.g., 'int8', 'float16', 'default'.")
+    device_index: Union[int, List[int]] = Field(0, description="GPU device index/indices.")
+    cpu_threads: int = Field(0, description="Number of CPU threads (0 for auto).")
+    num_workers: int = Field(1,
+                             description="Number of workers for WhisperModel (not BatchedInferencePipeline's batch_size).")
 
-class VADParams(BaseModel): threshold: Optional[float]=0.5; min_speech_duration_ms: Optional[int]=250; max_speech_duration_s: Optional[float]=float('inf'); min_silence_duration_ms: Optional[int]=2000; window_size_samples: Optional[int]=1024; speech_pad_ms: Optional[int]=400
-class BatchedVADParams(VADParams): min_silence_duration_ms: Optional[int]=160; max_speech_duration_s: Optional[float]=None
 
-class StandardTranscriptionParams(BaseModel): language: Optional[str]=None; task: str="transcribe"; beam_size: int=5; best_of: int=5; patience: float=1.0; length_penalty: float=1.0; repetition_penalty: float=1.0; no_repeat_ngram_size: int=0; temperature: Union[float, List[float]]=Field(default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]); compression_ratio_threshold: Optional[float]=2.4; log_prob_threshold: Optional[float]=-1.0; no_speech_threshold: Optional[float]=0.6; condition_on_previous_text: bool=True; prompt_reset_on_temperature: float=0.5; initial_prompt: Optional[Union[str, Iterable[int]]]=None; prefix: Optional[str]=None; suppress_blank: bool=True; suppress_tokens: Optional[List[int]]=Field(default=[-1]); without_timestamps: bool=False; max_initial_timestamp: float=1.0; word_timestamps: bool=False; prepend_punctuations: str="\"'“¿([{-"; append_punctuations: str="\"'.。,，!！?？:：”)]}、"; vad_filter: bool=False; vad_parameters: Optional[VADParams]=None; max_new_tokens: Optional[int]=None; clip_timestamps: str="0"; hallucination_silence_threshold: Optional[float]=None; hotwords: Optional[str]=None; language_detection_threshold: Optional[float]=0.5; language_detection_segments: int=1
-class BatchedTranscriptionParams(BaseModel): language: Optional[str]=None; task: str="transcribe"; beam_size: int=5; patience: float=1.0; length_penalty: float=1.0; repetition_penalty: float=1.0; no_repeat_ngram_size: int=0; temperature: Union[float, List[float]]=Field(default=[0.0]); initial_prompt: Optional[Union[str, Iterable[int]]]=None; suppress_blank: bool=True; suppress_tokens: Optional[List[int]]=Field(default=[-1]); without_timestamps: bool=True; word_timestamps: bool=False; prepend_punctuations: str="\"'“¿([{-"; append_punctuations: str="\"'.。,，!！?？:：”)]}、"; multilingual: bool=False; vad_filter: bool=True; vad_parameters: Optional[BatchedVADParams]=None; max_new_tokens: Optional[int]=None; chunk_length: Optional[int]=None; clip_timestamps: Optional[List[Dict[str, float]]]=None; batch_size: int=8; hotwords: Optional[str]=None; language_detection_threshold: Optional[float]=0.5; language_detection_segments: int=1
+class VADParams(BaseModel):
+    threshold: Optional[float] = 0.5;
+    min_speech_duration_ms: Optional[int] = 250
+    max_speech_duration_s: Optional[float] = float('inf');
+    min_silence_duration_ms: Optional[int] = 2000
+    window_size_samples: Optional[int] = 1024;
+    speech_pad_ms: Optional[int] = 400
 
-class TranscribeRequest(BaseModel): params: StandardTranscriptionParams; file_path: str = Field(...)
-class BatchedTranscribeRequest(BaseModel): params: BatchedTranscriptionParams; file_path: str = Field(...)
-class DetectLanguageRequest(BaseModel): vad_filter: bool=False; vad_parameters: Optional[VADParams]=None; language_detection_segments: int=1; language_detection_threshold: float=0.5; file_path: str = Field(...)
+
+class BatchedVADParams(VADParams):
+    min_silence_duration_ms: Optional[int] = 160
+    max_speech_duration_s: Optional[float] = None
+
+
+class StandardTranscriptionParams(BaseModel):
+    language: Optional[str] = Field(None, description="Language code (e.g., 'en'). None for auto-detect.");
+    task: str = Field("transcribe", description="'transcribe' or 'translate'")
+    beam_size: int = Field(5);
+    best_of: int = Field(5);
+    patience: float = Field(1.0);
+    length_penalty: float = Field(1.0)
+    repetition_penalty: float = Field(1.0);
+    no_repeat_ngram_size: int = Field(0)
+    temperature: Union[float, List[float]] = Field(default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    compression_ratio_threshold: Optional[float] = Field(2.4);
+    log_prob_threshold: Optional[float] = Field(-1.0)
+    no_speech_threshold: Optional[float] = Field(0.6);
+    condition_on_previous_text: bool = Field(True)
+    prompt_reset_on_temperature: float = Field(0.5);
+    initial_prompt: Optional[Union[str, Iterable[int]]] = Field(None)
+    prefix: Optional[str] = Field(None);
+    suppress_blank: bool = Field(True)
+    suppress_tokens: Optional[List[int]] = Field(default=[-1], description="List of token IDs. -1 for non-speech.");
+    without_timestamps: bool = Field(False)
+    max_initial_timestamp: float = Field(1.0);
+    word_timestamps: bool = Field(False, description="Enable word timestamps.")
+    prepend_punctuations: str = Field("\"'“¿([{-");
+    append_punctuations: str = Field("\"'.。,，!！?？:：”)]}、")
+    vad_filter: bool = Field(False, description="Enable VAD filter.");
+    vad_parameters: Optional[VADParams] = Field(None, description="VAD parameters.")
+    max_new_tokens: Optional[int] = Field(None);
+    clip_timestamps: str = Field("0", description="Timestamps to clip audio.")
+    hallucination_silence_threshold: Optional[float] = Field(None);
+    hotwords: Optional[str] = Field(None, description="Boost these words.")
+    language_detection_threshold: Optional[float] = Field(0.5);
+    language_detection_segments: int = Field(1)
+
+
+class BatchedTranscriptionParams(BaseModel):
+    language: Optional[str] = None;
+    task: str = "transcribe";
+    beam_size: int = Field(1, description="Usually 1 for batched pipeline.")
+    patience: float = 1.0;
+    length_penalty: float = 1.0;
+    repetition_penalty: float = 1.0;
+    no_repeat_ngram_size: int = 0
+    temperature: Union[float, List[float]] = Field(default=[0.0]);
+    initial_prompt: Optional[Union[str, Iterable[int]]] = None
+    suppress_blank: bool = True;
+    suppress_tokens: Optional[List[int]] = Field(default=[-1]);
+    without_timestamps: bool = True
+    word_timestamps: bool = False;
+    prepend_punctuations: str = "\"'“¿([{-";
+    append_punctuations: str = "\"'.。,，!！?？:：”)]}、"
+    vad_filter: bool = True;
+    vad_parameters: Optional[BatchedVADParams] = None
+    max_new_tokens: Optional[int] = None;
+    chunk_length: Optional[int] = Field(None, description="Audio chunk length for pipeline.")
+    clip_timestamps: Optional[Union[str, List[Dict[str, float]]]] = Field(None)
+    batch_size: int = Field(8, description="Inference batch size for pipeline.");
+    hotwords: Optional[str] = None
+    language_detection_threshold: Optional[float] = 0.5;
+    language_detection_segments: int = 1
+
+
+class TranscribeRequest(BaseModel):
+    params: StandardTranscriptionParams
+    file_path: str = Field(..., description="Filename relative to the service's internal shared audio path.")
+
+
+class BatchedTranscribeRequest(BaseModel):
+    params: BatchedTranscriptionParams
+    file_path: str = Field(..., description="Filename relative to the service's internal shared audio path.")
+
+
+class DetectLanguageRequest(BaseModel):
+    vad_filter: bool = False;
+    vad_parameters: Optional[VADParams] = None
+    language_detection_segments: int = 1;
+    language_detection_threshold: float = 0.5
+    file_path: str = Field(..., description="Filename relative to the service's internal shared audio path.")
+
 
 # --- FastAPI Application Instance ---
 app = FastAPI(
-    title="Stateful Faster Whisper Service (Local, No API Key)",
-    description="API service (no API Key) to dynamically load/unload Whisper models and process audio via shared paths.",
-    version="1.2.2" # Version bump for fix
+    title="On-Demand STT Service",
+    description="Dynamically load/unload Whisper models. Processes audio from a shared space defined by volume mounts. Uses fixed internal paths.",
+    version="2.1.0"  # Version bump for clarity
 )
+
 
 # --- Lifespan Events ---
 @app.on_event("startup")
 async def startup_event():
     global logger
-    logger = setup_logging()
-    logger.info(f"---- Starting Stateful Whisper Service (PID: {os.getpid()}) ----")
-    logger.info(f"Shared audio path: {SHARED_AUDIO_PATH.resolve()}")
-    logger.info(f"Model cache path: {MODEL_CACHE_PATH.resolve()}")
+    logger = setup_logging(LOG_LEVEL)  # logger will be named APP_LOGGER_NAME by setup_logging
+    logger.info(f"---- STT Service Starting (PID: {os.getpid()}) ----")
+    logger.info(f"LOG_LEVEL set to: {LOG_LEVEL}")
+    logger.info(f"Internal Shared Audio Path (fixed): {SHARED_AUDIO_PATH.resolve()}")
+    logger.info(f"Internal Model Cache Path (fixed): {MODEL_CACHE_PATH.resolve()}")
     try:
         SHARED_AUDIO_PATH.mkdir(parents=True, exist_ok=True)
         MODEL_CACHE_PATH.mkdir(parents=True, exist_ok=True)
-    except Exception as e: logger.error(f"Directory setup error: {e}")
-    logger.info("Service started IDLE.")
+        logger.info(f"Internal directory ensured: {SHARED_AUDIO_PATH.resolve()}")
+        logger.info(f"Internal directory ensured: {MODEL_CACHE_PATH.resolve()}")
+    except Exception as e:
+        logger.error(
+            f"CRITICAL: Failed to create/access fixed internal directories. Check Dockerfile 'mkdir' and permissions if this occurs.",
+            exc_info=True)
+    logger.info("STT Service initialized IDLE (no model loaded).")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.warning("---- Service Shutting Down ----")
-    async with model_lock: await _unload_model_internal()
-    logger.info("Service stopped.")
+    log_msg_prefix = f"[{APP_LOGGER_NAME}] " if logger else ""  # Handle if logger failed to init
+    print(f"{log_msg_prefix}---- STT Service Shutting Down ----")  # Print ensures visibility if logging is broken
+    if logger: logger.warning("Service Shutting Down (called via shutdown_event)")
+    async with model_lock:
+        await _unload_model_internal()
+    if logger:
+        logger.info("Service stopped.")
+    else:
+        print(f"{log_msg_prefix}Service stopped.")
 
-# --- Internal Model Management (Torch references REMOVED) ---
+
+# --- Internal Model Management ---
 async def _unload_model_internal():
     global current_model, current_config, current_batched_pipeline
     if current_model is not None:
-        model_info = f"{current_config.get('model_size_or_path','?')} ({current_config.get('device','?')})"
-        logger.warning(f"Unloading model: {model_info}")
-        # Explicitly delete references and run garbage collection
-        model_ref = current_model
+        model_info = f"{current_config.get('model_size_or_path', '?')} ({current_config.get('device', '?')})"
+        log_msg = f"Unloading model: {model_info}"
+        if logger:
+            logger.warning(log_msg)
+        else:
+            print(f"[{APP_LOGGER_NAME}] {log_msg}")
+        model_ref = current_model;
         batch_ref = current_batched_pipeline
-        current_model = None
-        current_config = None
+        current_model = None;
+        current_config = None;
         current_batched_pipeline = None
-        del model_ref
-        del batch_ref
-        gc.collect() # Suggest garbage collection
-        # REMOVED torch.cuda.empty_cache() block
-        logger.info(f"Model {model_info} unloaded.")
-        await asyncio.sleep(0.1) # Short sleep to allow potential cleanup
+        del model_ref;
+        del batch_ref;
+        gc.collect()
+        log_msg = f"Model {model_info} unloaded."
+        if logger:
+            logger.info(log_msg)
+        else:
+            print(f"[{APP_LOGGER_NAME}] {log_msg}")
+        await asyncio.sleep(0.1)
+
 
 async def _load_model_internal(config: ModelConfigParams):
     global current_model, current_config, current_batched_pipeline
-    logger.warning(f"Attempting to load model: {config.dict()}")
+    logger.info(f"Attempting to load model: {config.model_size_or_path} with config: {config.dict(exclude_none=True)}")
     start_time = time.time()
     try:
-        if not MODEL_CACHE_PATH.exists(): MODEL_CACHE_PATH.mkdir(parents=True, exist_ok=True)
-        loaded_model = WhisperModel(**config.dict(), download_root=str(MODEL_CACHE_PATH)) # Pass config directly
-        # Create batched pipeline AFTER successful model load
+        if not MODEL_CACHE_PATH.is_dir():
+            logger.warning(
+                f"Internal model cache path {MODEL_CACHE_PATH} is not a directory or doesn't exist. Attempting to create.")
+            MODEL_CACHE_PATH.mkdir(parents=True, exist_ok=True)
+
+        model_source = config.model_size_or_path
+        candidate_path = Path(model_source)
+        effective_model_source = model_source  # Default to what user provided
+
+        if not candidate_path.is_absolute():  # If it's not an absolute path like /other_mounted_models/my_model
+            # Check if it's a directory relative to our MODEL_CACHE_PATH
+            potential_local_path = MODEL_CACHE_PATH / model_source
+            if potential_local_path.is_dir():
+                effective_model_source = str(potential_local_path)
+                logger.info(f"Found local model directory in cache: {effective_model_source}")
+            else:
+                logger.info(
+                    f"Assuming '{model_source}' is a HuggingFace ID or downloadable path (not found as local dir in cache).")
+        else:  # User provided an absolute path (inside container)
+            logger.info(
+                f"Using provided absolute model path: {effective_model_source}. Ensure this path is accessible in the container.")
+
+        loaded_model = WhisperModel(effective_model_source,
+                                    device=config.device, device_index=config.device_index,
+                                    compute_type=config.compute_type, cpu_threads=config.cpu_threads,
+                                    num_workers=config.num_workers, download_root=str(MODEL_CACHE_PATH))
         loaded_batched_pipeline = BatchedInferencePipeline(model=loaded_model)
         current_model = loaded_model
-        current_batched_pipeline = loaded_batched_pipeline # Assign batched pipeline here
+        current_batched_pipeline = loaded_batched_pipeline
         current_config = config.dict()
         load_time = time.time() - start_time
-        logger.warning(f"Successfully loaded model '{config.model_size_or_path}' and pipeline in {load_time:.2f}s.")
+        logger.info(
+            f"Successfully loaded model '{config.model_size_or_path}' (resolved to '{effective_model_source}') and batched pipeline in {load_time:.2f}s.")
     except Exception as e:
-        logger.exception(f"FATAL: Failed to load model '{config.model_size_or_path}': {e}")
-        # Reset state if loading failed
-        current_model = None; current_config = None; current_batched_pipeline = None
-        # Attempt cleanup if load fails midway
-        gc.collect()
-        # REMOVED torch.cuda.empty_cache() block
-        raise # Re-raise the original loading error
+        logger.error(f"FATAL: Failed to load model '{config.model_size_or_path}': {e}", exc_info=True)
+        current_model = None;
+        current_config = None;
+        current_batched_pipeline = None
+        gc.collect();
+        raise
 
-# --- Helper Functions (VadOptions type hint FIXED) ---
-def sanitize_path(relative_path: str) -> Path:
-    if not relative_path:
-        raise ValueError("File path cannot be empty.")
-    # Normalize path, remove leading slashes/backslashes for consistency
-    normalized_path = os.path.normpath(relative_path).lstrip('/\\')
-    # Prevent path traversal ('..')
-    if ".." in normalized_path.split(os.sep):
-        raise ValueError("Relative paths ('..') are forbidden.")
-    # Join with the base shared path
-    full_path = SHARED_AUDIO_PATH.resolve().joinpath(normalized_path)
-    # Robust check: ensure the final resolved path is truly within the shared directory
-    if not full_path.is_relative_to(SHARED_AUDIO_PATH.resolve()):
-         raise ValueError("Path traversal attempt detected outside designated shared directory.")
-    return full_path
 
-def cleanup_audio_source(source_path: Optional[str]):
-    # Set to False if Django *guarantees* cleanup, True if FastAPI should attempt it
-    SHOULD_FASTAPI_CLEANUP = True # Or False, depending on deployment strategy
-    if not SHOULD_FASTAPI_CLEANUP or not source_path:
-        return
+# --- Helper Functions ---
+def sanitize_path(client_relative_path: str) -> Path:
+    if not client_relative_path:
+        raise ValueError("File path from client cannot be empty.")
+    normalized_client_path_str = os.path.normpath(client_relative_path).lstrip('/\\')
+    if ".." in normalized_client_path_str.split(os.sep):
+        logger.error(f"Forbidden '..' in client path component: '{client_relative_path}'")
+        raise ValueError("Path component '..' is forbidden in the provided file path.")
+    # SHARED_AUDIO_PATH is already an absolute internal path. We resolve it once more
+    # during comparison for utmost robustness, but it's fixed for the app's lifetime.
+    base_path_for_val = SHARED_AUDIO_PATH.resolve()
+    prospective_full_path = (base_path_for_val / normalized_client_path_str).resolve()
+    if not prospective_full_path.is_relative_to(base_path_for_val):
+        logger.error(
+            f"Path traversal attempt. Client path '{client_relative_path}' -> '{prospective_full_path}' is outside '{base_path_for_val}'.")
+        raise ValueError("Path resolves outside designated shared audio directory.")
+    return prospective_full_path
+
+
+def cleanup_audio_source(source_path_str: Optional[str]):
+    if not SHOULD_CLEANUP_AUDIO or not source_path_str: return
     try:
-        path_obj = Path(source_path)
-        if path_obj.is_file():
-            logger.info(f"FastAPI attempting to clean up source audio: {source_path}")
-            path_obj.unlink()
-        # else: logger.debug(f"Cleanup skipped: path not found or not a file: {source_path}")
+        path_obj = Path(source_path_str)
+        if path_obj.is_file(): logger.info(f"Attempting to clean up source audio: {source_path_str}"); path_obj.unlink(
+            missing_ok=True)
     except Exception as e:
-        # Log error but don't raise, cleanup is best-effort
-        logger.error(f"FastAPI cleanup failed for path '{source_path}': {e}")
+        logger.error(f"Cleanup failed for '{source_path_str}': {e}")
 
-# --- FIXED TYPE HINT for vad_parameters dictionary ---
-def _validate_vad_params(params: Optional[Union[VADParams, BatchedVADParams]]) -> Optional[dict]:
-    """Validates VAD parameters Pydantic model and returns a dictionary suitable for faster-whisper."""
-    if params is None:
-        return None
-    # Convert Pydantic model to dict, excluding fields that were not explicitly set
+
+def _validate_vad_params(params: Optional[Union[VADParams, BatchedVADParams]]) -> Optional[dict]:  # Unchanged
+    if params is None: return None
     vad_dict = params.dict(exclude_unset=True)
+    if isinstance(params, BatchedVADParams) and 'max_speech_duration_s' in vad_dict and vad_dict[
+        'max_speech_duration_s'] == float('inf'):
+        del vad_dict['max_speech_duration_s']
+    return vad_dict
 
-    # Specific adjustment for BatchedVADParams: remove 'max_speech_duration_s' if it's infinite,
-    # as faster-whisper might expect it absent or None in this case.
-    if isinstance(params, BatchedVADParams) and 'max_speech_duration_s' in vad_dict and vad_dict['max_speech_duration_s'] == float('inf'):
-         del vad_dict['max_speech_duration_s']
 
-    # Could add more validation here if needed (e.g., check ranges)
-    # For now, rely on Pydantic and faster-whisper internal validation primarily.
-
-    return vad_dict # Return the validated dictionary
-
-def _parse_clip_timestamps_standard(clip_timestamps_str: str) -> str:
-    """Validates the clip_timestamps string format."""
-    if clip_timestamps_str == "0":
-        return "0"
+def _parse_clip_timestamps_standard(clip_timestamps_str: str) -> str:  # Unchanged
+    if clip_timestamps_str == "0": return "0"
     try:
-        parts = clip_timestamps_str.split(',')
-        if not parts or not all(part.strip() for part in parts): # Ensure no empty parts
-             raise ValueError("Empty timestamp value found.")
-        # Validate that all parts can be converted to float
+        parts = clip_timestamps_str.split(',');
+        if not parts or not all(part.strip() for part in parts): raise ValueError("Empty timestamp value found.")
         [float(ts.strip()) for ts in parts]
-        # Return the validated string as is; faster-whisper handles the internal parsing.
         return clip_timestamps_str
     except ValueError as e:
-        logger.error(f"Invalid format for clip_timestamps: '{clip_timestamps_str}'. Error: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid clip_timestamps format. Expected comma-separated numbers (e.g., '10.5,25') or '0'. Received: '{clip_timestamps_str}'")
+        logger.error(f"Invalid clip_timestamps: '{clip_timestamps_str}'. {e}"); raise HTTPException(status_code=400,
+                                                                                                    detail=f"Invalid clip_timestamps: '{clip_timestamps_str}'")
 
-# --- API Endpoints (Unchanged logic, relying on corrected helpers) ---
 
-@app.get("/status", summary="Get Service Status")
-async def get_status():
-    # No auth needed
+# --- API Endpoints (Identical logic to the previous "final" set, just re-pasted for completeness) ---
+@app.get("/status", summary="Get current STT service status", response_model=Dict)
+async def get_stt_status_api():
     async with model_lock:
-        # Return a copy to prevent modification of the internal state dict
         status_data = {
-            "status": "loaded" if current_model else "idle",
-            "config": current_config.copy() if current_config else None
+            "service_status": "model_loaded" if current_model else "idle_no_model",
+            "loaded_model_config": current_config,
+            "internal_shared_audio_path": str(SHARED_AUDIO_PATH.resolve()),  # Show resolved path
+            "internal_model_cache_path": str(MODEL_CACHE_PATH.resolve()),  # Show resolved path
+            "log_level": LOG_LEVEL,
+            "audio_cleanup_enabled": SHOULD_CLEANUP_AUDIO
         }
     return status_data
 
-@app.post("/load_model", summary="Load Whisper Model", status_code=status.HTTP_200_OK)
-async def api_load_model(config: ModelConfigParams = Body(...)):
-    # No auth needed
-    request_id = f"load-{time.time_ns()}"
-    logger.info(f"[{request_id}] Received request to load model: {config.model_size_or_path} with config: {config.dict()}")
-    async with model_lock:
-        # Check if the exact same configuration is already loaded
-        if current_config and current_config == config.dict():
-             logger.warning(f"[{request_id}] Model '{config.model_size_or_path}' with the exact same configuration is already loaded. No action taken.")
-             return JSONResponse(
-                 status_code=status.HTTP_200_OK, # Indicate success, but note it was already loaded
-                 content={"status": "success", "message": "Model with this configuration already loaded.", "config": current_config.copy()}
-             )
 
-        # Proceed with loading (unload previous first if necessary)
-        logger.info(f"[{request_id}] Acquiring lock to change model state...")
+@app.post("/load_model", summary="Load a specific Whisper model configuration", status_code=status.HTTP_200_OK,
+          response_model=Dict)
+async def api_load_model(config: ModelConfigParams = Body(...)):
+    request_id = f"load-{time.time_ns()}"
+    logger.info(
+        f"[{request_id}] API: Load model req: {config.model_size_or_path}, Config: {config.dict(exclude_none=True)}")
+    async with model_lock:
+        if current_config and current_config == config.dict():
+            logger.info(f"[{request_id}] API: Model '{config.model_size_or_path}' already loaded with this config.")
+            return JSONResponse(status_code=status.HTTP_200_OK,
+                                content={"status": "success", "message": "Model already loaded.",
+                                         "config": current_config})
         try:
             if current_model:
-                logger.info(f"[{request_id}] Unloading existing model before loading the new one.")
-                await _unload_model_internal() # Unload previous if any
-            else:
-                 logger.info(f"[{request_id}] No model currently loaded, proceeding with load.")
-
+                prev_model_name = current_config.get('model_size_or_path') if current_config else "N/A"
+                logger.info(f"[{request_id}] API: Unloading existing model ('{prev_model_name}') first.")
+                await _unload_model_internal()
             await _load_model_internal(config)
-            logger.info(f"[{request_id}] Successfully completed load request.")
-            return {"status": "success", "message": "Model loaded successfully.", "config": current_config.copy()}
+            logger.info(f"[{request_id}] API: Successfully loaded model '{config.model_size_or_path}'.")
+            return {"status": "success", "message": "Model loaded successfully.", "config": current_config}
         except Exception as e:
-            # Error logged within _load_model_internal
-            logger.error(f"[{request_id}] Model loading process failed.")
-            # Return 500 Internal Server Error
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Model load failed: {str(e)}")
+            logger.error(f"[{request_id}] API: Model loading failed: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"Model load failed: {str(e)}")
 
-@app.post("/unload_model", summary="Unload Whisper Model")
+
+@app.post("/unload_model", summary="Unload the currently active Whisper model", response_model=Dict)
 async def api_unload_model():
-    # No auth needed
     request_id = f"unload-{time.time_ns()}"
-    logger.info(f"[{request_id}] Received request to unload model.")
+    logger.info(f"[{request_id}] API: Unload model req.")
     async with model_lock:
         if current_model is None:
-             logger.info(f"[{request_id}] No model is currently loaded. Unload request is a no-op.")
-             return {"status": "success", "message": "Already idle. No model was loaded."}
+            logger.info(f"[{request_id}] API: No model loaded. Unload is a no-op.")
+            return {"status": "success", "message": "Already idle. No model was loaded."}
         try:
-            logger.info(f"[{request_id}] Acquiring lock to unload model.")
             await _unload_model_internal()
-            logger.info(f"[{request_id}] Successfully unloaded model.")
+            logger.info(f"[{request_id}] API: Successfully unloaded model.")
             return {"status": "success", "message": "Model unloaded successfully."}
         except Exception as e:
-            logger.exception(f"[{request_id}] Failed during model unloading process.")
+            logger.error(f"[{request_id}] API: Model unloading failed.", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Model unload failed: {str(e)}")
 
-@app.post("/transcribe", summary="Transcribe Audio (Standard)")
+
+@app.post("/transcribe", summary="Transcribe audio using the currently loaded model")
 async def api_transcribe(request_data: TranscribeRequest = Body(...)):
-    # No auth needed
-    active_model: Optional[WhisperModel] = None # Hold reference to model used for this request
-    source_path_str: Optional[str] = None # Store sanitized path string for reliable cleanup
+    active_model_ref: Optional[WhisperModel] = None
+    source_path_abs_str: Optional[str] = None
     params = request_data.params
-    request_id = f"txn-{time.time_ns()}" # Simple unique ID for logging this request
-    logger.info(f"[{request_id}] Received standard transcribe request for file: '{request_data.file_path}'")
+    request_id = f"txn-{time.time_ns()}"
+    logger.info(f"[{request_id}] API: Transcribe req for client file: '{request_data.file_path}'")
 
-    # --- Acquire Lock and Check Model State ---
     async with model_lock:
         if current_model is None:
-            logger.error(f"[{request_id}] Transcription failed: No model loaded.")
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No model is currently loaded. Use /load_model first.")
-        # Keep a reference to the model being used for this request
-        active_model = current_model
-        active_config = current_config.copy() # Get config at time of request
-        logger.debug(f"[{request_id}] Using model: {active_config.get('model_size_or_path', 'unknown')}")
-    # --- Lock Released ---
+            logger.error(f"[{request_id}] API: No model loaded for transcription.")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No model loaded. Use /load_model first.")
+        active_model_ref = current_model
+        model_name_for_log = current_config.get('model_size_or_path', 'unknown') if current_config else 'unknown'
+        logger.debug(f"[{request_id}] API: Using loaded model: '{model_name_for_log}'")
 
     try:
-        # 1. Sanitize and Validate Input File Path
         full_path_obj = sanitize_path(request_data.file_path)
-        source_path_str = str(full_path_obj) # Use this string path consistently
+        source_path_abs_str = str(full_path_obj)
         if not full_path_obj.is_file():
-            logger.error(f"[{request_id}] Audio file not found at sanitized path: {source_path_str}")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Audio file not found at specified path: '{request_data.file_path}'")
-        logger.debug(f"[{request_id}] Accessing sanitized audio path: {source_path_str}")
+            logger.error(
+                f"[{request_id}] API: Audio file not found: {source_path_abs_str} (from '{request_data.file_path}')")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail=f"Audio file not found from '{request_data.file_path}'")
+        logger.debug(f"[{request_id}] API: Accessing audio: {source_path_abs_str}")
 
-        # 2. Decode Audio File
         start_decode = time.time()
         try:
-            # Expecting decode_audio to return a numpy array
-            audio_input = decode_audio(source_path_str, sampling_rate=16000)
-            decode_time = time.time() - start_decode
-            logger.info(f"[{request_id}] Decoded audio in {decode_time:.2f}s. Type: {type(audio_input)}, Shape: {getattr(audio_input, 'shape', 'N/A')}")
-            if not isinstance(audio_input, np.ndarray):
-                 logger.warning(f"[{request_id}] decode_audio did not return a NumPy array (type: {type(audio_input)}). Behavior may be unexpected.")
-        except Exception as decode_err:
-            logger.exception(f"[{request_id}] Failed to decode audio file: {source_path_str}")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to decode audio file: {str(decode_err)}")
+            audio_input = decode_audio(source_path_abs_str, sampling_rate=16000)
+            logger.info(f"[{request_id}] Decoded audio in {time.time() - start_decode:.2f}s.")
+        except Exception as de:
+            logger.error(f"[{request_id}] Failed to decode: {source_path_abs_str}", exc_info=True); raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=f"Decode failed: {str(de)}")
 
-
-        # 3. Prepare Transcription Parameters
-        start_prep = time.time()
-        # Validate temperature format
         temp_param = params.temperature
-        if not isinstance(temp_param, (list, tuple)):
-            try: temp_param = [float(temp_param)]
-            except ValueError:
-                logger.error(f"[{request_id}] Invalid temperature value: {params.temperature}")
-                raise HTTPException(status_code=400, detail=f"Invalid temperature value: {params.temperature}")
-
-        # Validate clip timestamps format
+        if not isinstance(temp_param, (list, tuple)): temp_param = [float(temp_param)]
         clip_timestamps_param = _parse_clip_timestamps_standard(params.clip_timestamps)
-
-        # Get VAD parameters dictionary
         vad_options_dict = _validate_vad_params(params.vad_parameters)
-
-        # Handle suppress_tokens, including resolving '-1' to non-speech tokens
         _suppress_tokens_processed = params.suppress_tokens
-        if -1 in (_suppress_tokens_processed or []):
-             try:
-                 from faster_whisper.tokenizer import Tokenizer # Import here if not globally needed
-                 # Use the tokenizer associated with the *active* model instance
-                 tokenizer = Tokenizer(active_model.hf_tokenizer,
-                                       active_model.model.is_multilingual,
-                                       task=params.task,
-                                       language=params.language) # Use specified language if available
-                 non_speech_tokens = list(tokenizer.non_speech_tokens) # Convert tuple to list
-                 # Combine user's non-negative tokens with non-speech tokens
-                 user_tokens = [t for t in params.suppress_tokens if t >= 0]
-                 _suppress_tokens_processed = sorted(list(set(user_tokens + non_speech_tokens)))
-                 logger.debug(f"[{request_id}] Suppressing tokens (incl. non-speech): {_suppress_tokens_processed}")
-             except ImportError:
-                 logger.error(f"[{request_id}] Tokenizer import failed. Cannot process suppress_tokens=-1.")
-                 raise HTTPException(status_code=500, detail="Internal error: Tokenizer component not available.")
-             except Exception as e:
-                 logger.exception(f"[{request_id}] Error processing suppress_tokens with Tokenizer: {e}")
-                 raise HTTPException(status_code=500, detail=f"Internal error processing suppress_tokens: {e}")
-        elif _suppress_tokens_processed is not None:
-            # Ensure it's a list of ints if provided but not containing -1
-             _suppress_tokens_processed = sorted(list(set(int(t) for t in _suppress_tokens_processed if t>=0)))
-             logger.debug(f"[{request_id}] Suppressing user-defined tokens: {_suppress_tokens_processed}")
-        else:
-             logger.debug(f"[{request_id}] No tokens explicitly suppressed.")
-             _suppress_tokens_processed = None # Ensure it's None if empty or originally None
-
-        # Collect final arguments for the transcribe call, excluding handled ones
-        transcribe_args = params.dict(
-            exclude={'vad_parameters', 'clip_timestamps', 'suppress_tokens', 'temperature'}
-        )
-        # Add back the processed/validated parameters
-        transcribe_args['vad_parameters'] = vad_options_dict
-        transcribe_args['clip_timestamps'] = clip_timestamps_param
-        transcribe_args['suppress_tokens'] = _suppress_tokens_processed
-        transcribe_args['temperature'] = temp_param # Use the validated list/tuple
-
-        prep_time = time.time() - start_prep
-        logger.info(f"[{request_id}] Prepared transcription parameters in {prep_time:.2f}s.")
-        # Avoid logging potentially sensitive initial_prompt unless debug level is very high
-        # logger.debug(f"[{request_id}] Final transcribe args (excluding audio): {transcribe_args}")
-
-        # 4. Define Async Generator for Streaming Response
-        async def generate_transcription():
-            # Ensure cleanup uses the path string captured before potential errors
-            nonlocal source_path_str
-            transcribe_start_time = time.time()
-            segment_count = 0
+        if _suppress_tokens_processed and -1 in _suppress_tokens_processed:
             try:
-                logger.info(f"[{request_id}] Starting transcription process...")
-                # Call the transcribe method on the *active_model* reference
-                segments_iterable, info = active_model.transcribe(audio=audio_input, **transcribe_args)
+                from faster_whisper.tokenizer import Tokenizer
+                tokenizer = Tokenizer(active_model_ref.hf_tokenizer, active_model_ref.model.is_multilingual,
+                                      task=params.task, language=params.language)
+                non_speech = list(tokenizer.non_speech_tokens);
+                user_set = [t for t in _suppress_tokens_processed if t >= 0 and isinstance(t, int)]
+                _suppress_tokens_processed = sorted(list(set(user_set + non_speech)))
+                logger.debug(f"[{request_id}] Suppressing (incl. non-speech): {_suppress_tokens_processed or 'None'}")
+            except Exception as e_tok:
+                logger.error(f"[{request_id}] Error suppress_tokens: {e_tok}", exc_info=True); raise HTTPException(
+                    status_code=500, detail="Internal error on suppress_tokens.")
+        elif _suppress_tokens_processed:
+            _suppress_tokens_processed = sorted(list(set(int(t) for t in _suppress_tokens_processed if
+                                                         t >= 0 and isinstance(t,
+                                                                               int))));_suppress_tokens_processed = _suppress_tokens_processed or None
+        else:
+            _suppress_tokens_processed = None
 
-                # Serialize and yield transcription info first
-                info_dict = info.__dict__.copy() # Make a copy to avoid modifying the original
-                # Convert nested option objects (dataclasses) to dictionaries for JSON serialization
-                if hasattr(info, 'transcription_options') and info.transcription_options:
-                    info_dict["transcription_options"] = info.transcription_options.__dict__
-                if hasattr(info, 'vad_options') and info.vad_options:
-                     # vad_options might be a dict or an internal object, handle appropriately
-                     info_dict["vad_options"] = info.vad_options if isinstance(info.vad_options, dict) else info.vad_options.__dict__
+        transcribe_args = params.dict(exclude={'vad_parameters', 'clip_timestamps', 'suppress_tokens', 'temperature'})
+        transcribe_args.update({'vad_parameters': vad_options_dict, 'clip_timestamps': clip_timestamps_param,
+                                'suppress_tokens': _suppress_tokens_processed, 'temperature': temp_param})
+        logger.debug(f"[{request_id}] Prepared transcribe params.")
 
-                yield json.dumps({"type": "info", "data": info_dict}) + "\n"
-                logger.debug(f"[{request_id}] Yielded info: Lang={info.language}, Duration={info.duration:.2f}s")
-
-                # Iterate through the segments generator/iterable returned by transcribe
-                for segment in segments_iterable:
-                    segment_count += 1
-                    segment_dict = segment.__dict__.copy()
-                    # Convert word timestamps list (if present) to list of dicts
-                    if segment.words:
-                        segment_dict["words"] = [w.__dict__ for w in segment.words]
-                    yield json.dumps({"type": "segment", "data": segment_dict}) + "\n"
-                    # Optional small sleep to yield control, test under load if needed
-                    # await asyncio.sleep(0.001)
-
-                transcribe_time = time.time() - transcribe_start_time
-                logger.info(f"[{request_id}] Transcription finished in {transcribe_time:.2f}s. Yielded {segment_count} segments.")
+        async def generate_transcription_stream():
+            nonlocal source_path_abs_str;
+            tx_start = time.time();
+            seg_count = 0
+            try:
+                logger.info(f"[{request_id}] Starting stream for {source_path_abs_str}...")
+                segments_iter, info_obj = active_model_ref.transcribe(audio=audio_input, **transcribe_args)
+                info_data = info_obj.__dict__.copy()  # Make a copy
+                if hasattr(info_obj, 'transcription_options') and info_obj.transcription_options: info_data[
+                    "transcription_options"] = info_obj.transcription_options.__dict__
+                if hasattr(info_obj, 'vad_options') and info_obj.vad_options: info_data[
+                    "vad_options"] = info_obj.vad_options if isinstance(info_obj.vad_options,
+                                                                        dict) else info_obj.vad_options.__dict__
+                yield json.dumps({"type": "info", "data": info_data}) + "\n"
+                for segment in segments_iter:
+                    seg_count += 1;
+                    seg_data = segment.__dict__.copy()
+                    if segment.words: seg_data["words"] = [w.__dict__ for w in segment.words]
+                    yield json.dumps({"type": "segment", "data": seg_data}) + "\n"
+                logger.info(f"[{request_id}] Stream finished in {time.time() - tx_start:.2f}s. Segments: {seg_count}.")
                 yield json.dumps({"type": "final", "message": "Transcription complete."}) + "\n"
-
             except Exception as e_stream:
-                logger.exception(f"[{request_id}] Error during transcription stream generation: {e_stream}")
-                # Yield a JSON error message
-                yield json.dumps({"type": "error", "message": f"Transcription stream error: {traceback.format_exc()}"}) + "\n"
+                logger.error(f"[{request_id}] Stream error for {source_path_abs_str}: {e_stream}",
+                             exc_info=True); yield json.dumps(
+                    {"type": "error", "message": f"Stream error: {traceback.format_exc()}"}) + "\n"
             finally:
-                # Ensure cleanup runs regardless of stream success/failure
-                logger.info(f"[{request_id}] Cleaning up audio source (if enabled): {source_path_str}")
-                cleanup_audio_source(source_path_str)
+                cleanup_audio_source(source_path_abs_str)
 
-        # 5. Return the Streaming Response
-        return StreamingResponse(generate_transcription(), media_type="application/x-ndjson")
+        return StreamingResponse(generate_transcription_stream(), media_type="application/x-ndjson")
+    except HTTPException:
+        cleanup_audio_source(source_path_abs_str); raise
+    except ValueError as ve:
+        logger.error(f"[{request_id}] Input error: {ve}", exc_info=True); cleanup_audio_source(
+            source_path_abs_str); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e_gen:
+        logger.error(f"[{request_id}] General error: {e_gen}", exc_info=True); cleanup_audio_source(
+            source_path_abs_str); raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                                      detail=f"Unexpected error: {str(e_gen)}")
 
-    # --- Error Handling for Setup Phase (before streaming starts) ---
-    except HTTPException as http_exc:
-        # Log known HTTP exceptions (like 404, 400, 409) before re-raising
-        logger.error(f"[{request_id}] HTTP Exception during setup: {http_exc.status_code} - {http_exc.detail}")
-        cleanup_audio_source(source_path_str) # Attempt cleanup on setup errors
-        raise http_exc
-    except ValueError as val_err: # Catch specific setup errors like path issues
-        logger.error(f"[{request_id}] Value Error during setup: {val_err}")
-        cleanup_audio_source(source_path_str)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(val_err))
-    except Exception as e_setup:
-        # Catch unexpected errors during setup (e.g., decoding, param prep)
-        logger.exception(f"[{request_id}] Unexpected setup error before transcription: {e_setup}")
-        cleanup_audio_source(source_path_str)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during transcription setup: {str(e_setup)}")
 
-@app.post("/transcribe_batched", summary="Transcribe Audio (Batched)")
+@app.post("/transcribe_batched", summary="Transcribe audio using the currently loaded model's batched pipeline")
 async def api_transcribe_batched(request_data: BatchedTranscribeRequest = Body(...)):
-    # No auth needed
-    active_batched_pipeline: Optional[BatchedInferencePipeline] = None
-    active_model: Optional[WhisperModel] = None # Need model ref for tokenizer
-    source_path_str: Optional[str] = None
-    params = request_data.params
+    active_pipeline_ref: Optional[BatchedInferencePipeline] = None
+    active_model_for_tokenizer_ref: Optional[WhisperModel] = None
+    source_path_abs_str: Optional[str] = None
+    params = request_data.params;
     request_id = f"batch-txn-{time.time_ns()}"
-    logger.info(f"[{request_id}] Received batched transcribe request for file: '{request_data.file_path}'")
+    logger.info(f"[{request_id}] API: Batched transcribe req for client file: '{request_data.file_path}'")
 
-    # --- Acquire Lock and Check Model/Pipeline State ---
     async with model_lock:
-        if current_batched_pipeline is None or current_model is None: # Need both pipeline and underlying model
-            logger.error(f"[{request_id}] Batched transcription failed: Model or pipeline not loaded.")
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Batched pipeline requires a loaded model. Use /load_model first.")
-        active_batched_pipeline = current_batched_pipeline
-        active_model = current_model # Get reference to underlying model
-        active_config = current_config.copy()
-        logger.debug(f"[{request_id}] Using batched pipeline for model: {active_config.get('model_size_or_path', 'unknown')}")
-    # --- Lock Released ---
-
+        if not (current_batched_pipeline and current_model):
+            logger.error(f"[{request_id}] API: Batched tx failed - No model/pipeline loaded.")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                                detail="No model/pipeline. Use /load_model first.")
+        active_pipeline_ref = current_batched_pipeline
+        active_model_for_tokenizer_ref = current_model
+        model_name = current_config.get('model_size_or_path', 'unknown') if current_config else 'unknown'
+        logger.debug(f"[{request_id}] API: Using loaded batched pipeline for model: '{model_name}'")
     try:
-        # 1. Sanitize and Validate Input File Path
         full_path_obj = sanitize_path(request_data.file_path)
-        source_path_str = str(full_path_obj)
-        if not full_path_obj.is_file():
-            logger.error(f"[{request_id}] Audio file not found at sanitized path: {source_path_str}")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Audio file not found: '{request_data.file_path}'")
-        logger.debug(f"[{request_id}] Accessing sanitized audio path: {source_path_str}")
-
-        # 2. Decode Audio File
+        source_path_abs_str = str(full_path_obj)
+        if not full_path_obj.is_file(): logger.error(
+            f"[{request_id}] API: Audio file not found: {source_path_abs_str} (from '{request_data.file_path}')"); raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Audio file not found from '{request_data.file_path}'")
+        logger.debug(f"[{request_id}] API: Accessing audio: {source_path_abs_str}")
         start_decode = time.time()
         try:
-            audio_input = decode_audio(source_path_str, sampling_rate=16000)
-            decode_time = time.time() - start_decode
-            logger.info(f"[{request_id}] Decoded audio in {decode_time:.2f}s. Type: {type(audio_input)}, Shape: {getattr(audio_input, 'shape', 'N/A')}")
-            if not isinstance(audio_input, np.ndarray):
-                 logger.warning(f"[{request_id}] decode_audio did not return NumPy array (type: {type(audio_input)}).")
-        except Exception as decode_err:
-             logger.exception(f"[{request_id}] Failed to decode audio file: {source_path_str}")
-             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to decode audio file: {str(decode_err)}")
+            audio_input = decode_audio(source_path_abs_str, sampling_rate=16000); logger.info(
+                f"[{request_id}] Decoded audio in {time.time() - start_decode:.2f}s.")
+        except Exception as de:
+            logger.error(f"[{request_id}] Failed to decode: {source_path_abs_str}", exc_info=True); raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=f"Decode failed: {str(de)}")
 
-
-        # 3. Prepare Batched Transcription Parameters
-        start_prep = time.time()
-        # Validate temperature format
         temp_param = params.temperature
-        if not isinstance(temp_param, (list, tuple)):
-            try: temp_param = [float(temp_param)]
-            except ValueError: raise HTTPException(status_code=400, detail=f"Invalid temperature: {params.temperature}")
-
-        # Get VAD parameters dictionary (using BatchedVADParams model)
+        if not isinstance(temp_param, (list, tuple)): temp_param = [float(temp_param)]
         vad_options_dict = _validate_vad_params(params.vad_parameters)
-
-        # Handle suppress_tokens (needs tokenizer from the underlying model)
         _suppress_tokens_processed = params.suppress_tokens
-        if -1 in (_suppress_tokens_processed or []):
-             try:
-                 from faster_whisper.tokenizer import Tokenizer
-                 # Use tokenizer from the model associated with the *active* pipeline
-                 tokenizer = Tokenizer(active_model.hf_tokenizer,
-                                       active_model.model.is_multilingual,
-                                       task=params.task, language=params.language)
-                 non_speech_tokens = list(tokenizer.non_speech_tokens)
-                 user_tokens = [t for t in params.suppress_tokens if t >= 0]
-                 _suppress_tokens_processed = sorted(list(set(user_tokens + non_speech_tokens)))
-                 logger.debug(f"[{request_id}] Suppressing tokens (incl. non-speech): {_suppress_tokens_processed}")
-             except ImportError:
-                 logger.error(f"[{request_id}] Tokenizer import failed for batched suppression.")
-                 raise HTTPException(status_code=500, detail="Internal error: Tokenizer component not available.")
-             except Exception as e:
-                 logger.exception(f"[{request_id}] Error processing batched suppress_tokens: {e}")
-                 raise HTTPException(status_code=500, detail=f"Internal error processing suppress_tokens: {e}")
-        elif _suppress_tokens_processed is not None:
-             _suppress_tokens_processed = sorted(list(set(int(t) for t in _suppress_tokens_processed if t>=0)))
-             logger.debug(f"[{request_id}] Suppressing user-defined tokens: {_suppress_tokens_processed}")
-        else:
-             logger.debug(f"[{request_id}] No tokens explicitly suppressed for batch.")
-             _suppress_tokens_processed = None
-
-
-        # Collect final arguments for the batched pipeline call
-        transcribe_args = params.dict(
-            exclude={'vad_parameters', 'suppress_tokens', 'temperature'}
-        )
-        transcribe_args['vad_parameters'] = vad_options_dict
-        transcribe_args['suppress_tokens'] = _suppress_tokens_processed
-        transcribe_args['temperature'] = temp_param
-        # Note: Batch size is handled by the pipeline itself based on params.batch_size
-
-        prep_time = time.time() - start_prep
-        logger.info(f"[{request_id}] Prepared batched transcription parameters in {prep_time:.2f}s.")
-        # logger.debug(f"[{request_id}] Final batched transcribe args (excluding audio): {transcribe_args}")
-
-        # 4. Define Async Generator for Streaming Response
-        async def generate_transcription_batched():
-            nonlocal source_path_str
-            transcribe_start_time = time.time()
-            segment_count = 0
+        if _suppress_tokens_processed and -1 in _suppress_tokens_processed:
             try:
-                logger.info(f"[{request_id}] Starting batched transcription process...")
-                # Call the batched pipeline (which might be synchronous internally)
-                # The pipeline likely returns an iterable/list of results directly.
-                # Check faster-whisper docs: BatchedInferencePipeline.__call__ returns an iterable of Segment objects.
-                segments_iterable = active_batched_pipeline(audio=audio_input, **transcribe_args)
+                from faster_whisper.tokenizer import Tokenizer
+                tokenizer = Tokenizer(active_model_for_tokenizer_ref.hf_tokenizer,
+                                      active_model_for_tokenizer_ref.model.is_multilingual, task=params.task,
+                                      language=params.language)
+                non_speech = list(tokenizer.non_speech_tokens);
+                user_set = [t for t in _suppress_tokens_processed if t >= 0 and isinstance(t, int)]
+                _suppress_tokens_processed = sorted(list(set(user_set + non_speech)))
+            except Exception as e_tok_b:
+                logger.error(f"[{request_id}] Error suppress_tokens_batched: {e_tok_b}",
+                             exc_info=True); raise HTTPException(status_code=500,
+                                                                 detail="Internal error on suppress_tokens.")
+        elif _suppress_tokens_processed:
+            _suppress_tokens_processed = sorted(list(set(int(t) for t in _suppress_tokens_processed if
+                                                         t >= 0 and isinstance(t,
+                                                                               int)))); _suppress_tokens_processed = _suppress_tokens_processed or None
+        else:
+            _suppress_tokens_processed = None
 
-                # Yield a placeholder info message as batched pipeline doesn't return a separate info object
-                yield json.dumps({"type": "info", "data": {"message": "Batched processing started.", "params": params.dict(exclude_unset=True)}}) + "\n"
+        pipeline_call_args = {k: v for k, v in params.dict(exclude_none=True).items() if
+                              k not in ['vad_parameters', 'temperature', 'suppress_tokens']}
+        pipeline_call_args.update({'vad_parameters': vad_options_dict, 'temperature': temp_param,
+                                   'suppress_tokens': _suppress_tokens_processed})
+        logger.debug(f"[{request_id}] Prepared batched transcribe params. Batch size: {params.batch_size}")
 
-                # Iterate through the results from the batched pipeline
-                for segment in segments_iterable:
-                    segment_count += 1
-                    segment_dict = segment.__dict__.copy()
-                    if segment.words:
-                        segment_dict["words"] = [w.__dict__ for w in segment.words]
-                    yield json.dumps({"type": "segment", "data": segment_dict}) + "\n"
-                    # await asyncio.sleep(0.001) # Optional yield point if needed
-
-                transcribe_time = time.time() - transcribe_start_time
-                logger.info(f"[{request_id}] Batched transcription finished in {transcribe_time:.2f}s. Processed {segment_count} segments.")
+        async def generate_batched_stream():
+            nonlocal source_path_abs_str;
+            tx_start = time.time();
+            seg_count = 0
+            try:
+                logger.info(f"[{request_id}] Starting batched stream for {source_path_abs_str}...")
+                segments_iter = active_pipeline_ref(audio=audio_input, **pipeline_call_args)
+                yield json.dumps({"type": "info", "data": {"message": "Batched processing started.",
+                                                           "parameters_used": {k: v for k, v in
+                                                                               pipeline_call_args.items() if
+                                                                               k != 'vad_parameters' or v is not None}}}) + "\n"  # Avoid logging large VAD params unless needed
+                for segment in segments_iter:
+                    seg_count += 1;
+                    seg_data = segment.__dict__.copy()
+                    if segment.words: seg_data["words"] = [w.__dict__ for w in segment.words]
+                    yield json.dumps({"type": "segment", "data": seg_data}) + "\n"
+                logger.info(
+                    f"[{request_id}] Batched stream finished in {time.time() - tx_start:.2f}s. Segments: {seg_count}.")
                 yield json.dumps({"type": "final", "message": "Batched transcription complete."}) + "\n"
-
-            except Exception as e_stream:
-                logger.exception(f"[{request_id}] Error during batched transcription stream: {e_stream}")
-                yield json.dumps({"type": "error", "message": f"Batched transcription stream error: {traceback.format_exc()}"}) + "\n"
+            except Exception as e_stream_b:
+                logger.error(f"[{request_id}] Batched stream error for {source_path_abs_str}: {e_stream_b}",
+                             exc_info=True); yield json.dumps(
+                    {"type": "error", "message": f"Batched stream error: {traceback.format_exc()}"}) + "\n"
             finally:
-                logger.info(f"[{request_id}] Cleaning up audio source (if enabled): {source_path_str}")
-                cleanup_audio_source(source_path_str)
+                cleanup_audio_source(source_path_abs_str)
 
-        # 5. Return Streaming Response
-        return StreamingResponse(generate_transcription_batched(), media_type="application/x-ndjson")
-
-    # --- Error Handling for Setup Phase ---
-    except HTTPException as http_exc:
-        logger.error(f"[{request_id}] HTTP Exception during setup: {http_exc.status_code} - {http_exc.detail}")
-        cleanup_audio_source(source_path_str)
-        raise http_exc
-    except ValueError as val_err:
-        logger.error(f"[{request_id}] Value Error during setup: {val_err}")
-        cleanup_audio_source(source_path_str)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(val_err))
-    except Exception as e_setup:
-        logger.exception(f"[{request_id}] Unexpected setup error before batched transcription: {e_setup}")
-        cleanup_audio_source(source_path_str)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during batched transcription setup: {str(e_setup)}")
+        return StreamingResponse(generate_batched_stream(), media_type="application/x-ndjson")
+    except HTTPException:
+        cleanup_audio_source(source_path_abs_str); raise
+    except ValueError as ve_b:
+        logger.error(f"[{request_id}] Input error: {ve_b}", exc_info=True); cleanup_audio_source(
+            source_path_abs_str); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve_b))
+    except Exception as e_gen_b:
+        logger.error(f"[{request_id}] General error: {e_gen_b}", exc_info=True); cleanup_audio_source(
+            source_path_abs_str); raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                                      detail=f"Unexpected error: {str(e_gen_b)}")
 
 
-@app.post("/detect_language", summary="Detect Audio Language")
+@app.post("/detect_language", summary="Detect language using the currently loaded model", response_model=Dict)
 async def api_detect_language(request_data: DetectLanguageRequest = Body(...)):
-    # No auth needed
-    active_model: Optional[WhisperModel] = None
-    source_path_str: Optional[str] = None
-    params = request_data
+    active_model_ref: Optional[WhisperModel] = None
+    source_path_abs_str: Optional[str] = None
+    params = request_data;
     request_id = f"lang-{time.time_ns()}"
-    logger.info(f"[{request_id}] Received language detection request for file: '{params.file_path}'")
+    logger.info(f"[{request_id}] API: Lang detect req for client file: '{params.file_path}'")
 
-    # --- Acquire Lock and Check Model State ---
     async with model_lock:
-        if current_model is None:
-            logger.error(f"[{request_id}] Language detection failed: No model loaded.")
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No model is currently loaded.")
-        # Check if the loaded model is multilingual *before* proceeding
-        if not current_model.model.is_multilingual:
-            loaded_model_name = current_config.get('model_size_or_path', 'unknown') if current_config else 'unknown'
-            logger.warning(f"[{request_id}] Language detection skipped: Loaded model '{loaded_model_name}' is English-only.")
-            # Return a consistent JSON response indicating English-only model
-            cleanup_audio_source(None) # No file processed, so no cleanup needed here
-            return JSONResponse(content={
-                "language": "en",
-                "language_probability": 1.0,
-                "all_language_probs": {"en": 1.0},
-                "message": f"Detection skipped: Loaded model ({loaded_model_name}) is English-only."
-            })
-        active_model = current_model
-        logger.debug(f"[{request_id}] Using multilingual model for detection.")
-    # --- Lock Released ---
-
+        if current_model is None: logger.error(
+            f"[{request_id}] API: Lang detect failed - No model loaded."); raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="No model loaded.")
+        active_model_ref = current_model
+        if not active_model_ref.model.is_multilingual:
+            model_name = current_config.get('model_size_or_path', 'unknown') if current_config else 'unknown'
+            logger.warning(f"[{request_id}] API: Lang detect skipped: Model '{model_name}' is English-only.")
+            return JSONResponse(
+                content={"language": "en", "language_probability": 1.0, "all_language_probs": {"en": 1.0},
+                         "message": f"Model ({model_name}) is English-only."})
+        logger.debug(f"[{request_id}] API: Using multilingual model for detection.")
     try:
-        # 1. Sanitize and Validate Input File Path
         full_path_obj = sanitize_path(params.file_path)
-        source_path_str = str(full_path_obj)
-        if not full_path_obj.is_file():
-            logger.error(f"[{request_id}] Audio file not found at sanitized path: {source_path_str}")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Audio file not found: '{params.file_path}'")
-        logger.debug(f"[{request_id}] Accessing sanitized audio path: {source_path_str}")
-
-        # 2. Decode Audio File
+        source_path_abs_str = str(full_path_obj)
+        if not full_path_obj.is_file(): logger.error(
+            f"[{request_id}] API: Audio file not found: {source_path_abs_str} (from '{params.file_path}')"); raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Audio file not found from '{params.file_path}'")
+        logger.debug(f"[{request_id}] API: Accessing audio: {source_path_abs_str}")
         start_decode = time.time()
         try:
-            audio_input = decode_audio(source_path_str, sampling_rate=16000)
-            decode_time = time.time() - start_decode
-            logger.info(f"[{request_id}] Decoded audio in {decode_time:.2f}s. Type: {type(audio_input)}, Shape: {getattr(audio_input, 'shape', 'N/A')}")
-        except Exception as decode_err:
-            logger.exception(f"[{request_id}] Failed to decode audio file: {source_path_str}")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Failed to decode audio file: {str(decode_err)}")
+            audio_input = decode_audio(source_path_abs_str, sampling_rate=16000); logger.info(
+                f"[{request_id}] Decoded audio in {time.time() - start_decode:.2f}s.")
+        except Exception as de_l:
+            logger.error(f"[{request_id}] Failed to decode: {source_path_abs_str}", exc_info=True); raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=f"Decode failed: {str(de_l)}")
 
-
-        # 3. Prepare Detection Parameters
         vad_options_dict = _validate_vad_params(params.vad_parameters)
-        # Collect arguments for detect_language
         detect_args = params.dict(exclude={'file_path', 'vad_parameters'})
         detect_args['vad_parameters'] = vad_options_dict
-        logger.debug(f"[{request_id}] Detect language args (excluding audio): {detect_args}")
-
-        # 4. Perform Language Detection
+        detect_args = {k: v for k, v in detect_args.items() if v is not None}  # Ensure no None values for kwargs
+        logger.debug(f"[{request_id}] Detect language args: {detect_args}")
         detect_start_time = time.time()
         try:
-            # Call detect_language on the active_model reference
-            # Returns tuple: (detected_language, probability, Optional[dict_of_all_probs])
-            detection_result = active_model.detect_language(audio=audio_input, **detect_args)
-            detect_time = time.time() - detect_start_time
-
-            # Unpack result safely
-            lang = detection_result[0] if len(detection_result) > 0 else None
-            prob = detection_result[1] if len(detection_result) > 1 else None
-            all_probs = detection_result[2] if len(detection_result) > 2 else None
-
-            logger.info(f"[{request_id}] Language detection completed in {detect_time:.2f}s. Detected: {lang} (Prob: {prob:.4f})")
-
-            # 5. Return JSON Response
-            return JSONResponse(content={
-                "language": lang,
-                "language_probability": prob,
-                "all_language_probs": all_probs if all_probs is not None else {} # Return empty dict if None
-            })
+            detection_result_tuple = active_model_ref.detect_language(audio=audio_input, **detect_args)
+            lang, prob = detection_result_tuple[0:2] if detection_result_tuple and len(
+                detection_result_tuple) >= 2 else (None, None)
+            all_probs = detection_result_tuple[2] if detection_result_tuple and len(
+                detection_result_tuple) > 2 else None
+            logger.info(
+                f"[{request_id}] Lang detect completed in {time.time() - detect_start_time:.2f}s. Detected: {lang} (Prob: {prob:.4f if prob is not None else 'N/A'})")
+            return JSONResponse(content={"language": lang, "language_probability": prob,
+                                         "all_language_probs": all_probs if all_probs is not None else {}})
         except Exception as detect_err:
-             logger.exception(f"[{request_id}] Error occurred during faster_whisper.detect_language call.")
-             raise HTTPException(status_code=500, detail=f"Language detection failed internally: {str(detect_err)}")
-
-    # --- Error Handling for Setup Phase ---
-    except HTTPException as http_exc:
-        logger.error(f"[{request_id}] HTTP Exception during setup: {http_exc.status_code} - {http_exc.detail}")
-        cleanup_audio_source(source_path_str) # Attempt cleanup on setup errors
-        raise http_exc
-    except ValueError as val_err:
-        logger.error(f"[{request_id}] Value Error during setup: {val_err}")
-        cleanup_audio_source(source_path_str)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(val_err))
-    except Exception as e_setup:
-        logger.exception(f"[{request_id}] Unexpected setup error before language detection: {e_setup}")
-        cleanup_audio_source(source_path_str)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during language detection setup: {str(e_setup)}")
-    finally:
-        # Ensure cleanup runs even if JSONResponse fails (though unlikely)
-        # Cleanup is already called within the successful path and error handlers above.
-        # Calling it again here is safe due to checks within cleanup_audio_source.
-        cleanup_audio_source(source_path_str)
+            logger.error(f"[{request_id}] Error in detect_language for {source_path_abs_str}.",
+                         exc_info=True); raise HTTPException(status_code=500,
+                                                             detail=f"Language detection failed: {str(detect_err)}")
+    except HTTPException:
+        cleanup_audio_source(source_path_abs_str); raise
+    except ValueError as ve_l:
+        logger.error(f"[{request_id}] Input error: {ve_l}", exc_info=True); cleanup_audio_source(
+            source_path_abs_str); raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve_l))
+    except Exception as e_gen_l:
+        logger.error(f"[{request_id}] General error: {e_gen_l}", exc_info=True); cleanup_audio_source(
+            source_path_abs_str); raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                                      detail=f"Unexpected error: {str(e_gen_l)}")
 
 
-# --- WebSocket Log Endpoint (No Changes Needed Here) ---
 @app.websocket("/ws/logs")
 async def websocket_log_endpoint(websocket: WebSocket):
-    # No auth needed
     await websocket.accept()
     log_websockets.add(websocket)
     client_info = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "unknown client"
-    logger.info(f"Log WebSocket client connected: {client_info}")
+    # Use logger if available, otherwise print
+    log_func = logger.info if logger else lambda msg: print(f"[{APP_LOGGER_NAME}] {msg}")
+    log_func(f"Log WebSocket client connected: {client_info}")
     try:
-        # Keep connection alive by waiting for messages (client pings or any text)
-        while True:
-            # This just waits for data/close signal, doesn't process client messages
-            await websocket.receive_text()
+        while True: await websocket.receive_text()  # Keep alive
     except WebSocketDisconnect as e:
-        # Log graceful disconnects at INFO level
-        logger.info(f"Log WebSocket client disconnected: {client_info}. Code: {e.code}, Reason: {e.reason}")
-    except Exception as e:
-        # Log unexpected errors during WebSocket communication
-        logger.error(f"Log WebSocket error for {client_info}: {e}", exc_info=True)
+        log_func(f"Log WebSocket client disconnected: {client_info}. Code: {e.code}, Reason: {e.reason or 'N/A'}")
+    except Exception as e_ws:
+        if logger:
+            logger.error(f"Log WebSocket error for {client_info}: {e_ws}", exc_info=True)
+        else:
+            print(f"[{APP_LOGGER_NAME}] Log WebSocket error for {client_info}: {e_ws}\n{traceback.format_exc()}")
     finally:
-        # Ensure websocket is removed from the active set
-        if websocket in log_websockets:
-            log_websockets.remove(websocket)
-        logger.info(f"Log WebSocket connection closed for {client_info}. Active log clients: {len(log_websockets)}")
+        if websocket in log_websockets: log_websockets.remove(websocket)
+        log_func(f"Log WebSocket connection closed for {client_info}. Active: {len(log_websockets)}")
 
 
-# --- Main Execution Block (No Changes Needed Here) ---
+# --- Main Execution Block (for Uvicorn run from CMD in Dockerfile) ---
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", "8000"))
-    # Default to 127.0.0.1 for security when API key is removed
-    host = os.getenv("HOST", "127.0.0.1")
+    print(f"---- STT Service: Preparing to Start (via __main__, usually for local dev testing) ----")
+    print(f"ENV HOST: {APP_HOST} (Uvicorn will bind here)")
+    print(f"ENV PORT: {APP_PORT} (Uvicorn will bind here)")
+    print(f"ENV LOG_LEVEL: {LOG_LEVEL}")
+    print(f"FIXED Internal Shared Audio Path: {SHARED_AUDIO_PATH}")
+    print(f"FIXED Internal Model Cache Path: {MODEL_CACHE_PATH}")
+    print(f"Audio Cleanup Enabled (from ENV '{ENV_CLEANUP_AUDIO}'): {SHOULD_CLEANUP_AUDIO}")
+    print(f"---------------------------------------------------------------------------------")
 
-    # Basic print statements before full logging is configured via startup event
-    print(f"---- Preparing to Start Service ----")
-    print(f"Host: {host}")
-    print(f"Port: {port}")
-    print(f"Shared Audio Path: {SHARED_AUDIO_PATH.resolve()}")
-    print(f"Model Cache Path: {MODEL_CACHE_PATH.resolve()}")
-    print(f"------------------------------------")
-
-    # Run Uvicorn server
     uvicorn.run(
-        "main:app",         # App location
-        host=host,          # Listen address
-        port=port,          # Listen port
-        workers=1,          # Crucial for stateful model management without IPC
-        log_config=None,    # Disable default uvicorn logging to use our custom config
-        reload=False        # Disable auto-reload for stability
+        "main:app",  # app instance in main.py
+        host=APP_HOST,
+        port=APP_PORT,
+        workers=1,  # Crucial for stateful model management
+        log_config=None,  # Our logging_config.py handles it
+        reload=False,  # Should be False for this on-demand container model
+        log_level=LOG_LEVEL.lower()  # Pass log level to Uvicorn as well
     )

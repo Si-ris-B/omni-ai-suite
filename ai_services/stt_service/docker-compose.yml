@@ -1,0 +1,32 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  stt-service:
+    build:
+      context: .      # Tells Docker Compose to build an image from the Dockerfile
+      dockerfile: Dockerfile
+    # The 'image' line is not strictly necessary if you are always building locally
+    # and not pushing/pulling from a specific named image in a registry.
+    # If you DO want to name the image built by compose, you can use:
+    # image: local/stt-service:latest
+    container_name: stt_service_container
+    ports:
+      - "8088:8001"
+    volumes:
+      - ./project_data/stt_input_audio:/stt_service_data/audio
+      - ./project_data/stt_model_cache:/stt_service_data/models
+    environment:
+      - STT_SHARED_AUDIO_PATH=/stt_service_data/audio
+      - STT_MODEL_CACHE_PATH=/stt_service_data/models
+      - LOG_LEVEL=INFO
+      - CLEANUP_AUDIO=True
+      - PORT=8001
+    # deploy: # For GPU
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
