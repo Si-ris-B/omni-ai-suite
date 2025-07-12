@@ -53,12 +53,17 @@ INSTALLED_APPS = [
 
     # Third-Party Apps
     'rest_framework',        # Django REST Framework for APIs
-    'corsheaders',           # For handling Cross-Origin Resource Sharing
+    'corsheaders',
+    'django_celery_beat', # Add this for scheduled tasks
+    # For handling Cross-Origin Resource Sharing
 
-    # Your Local Apps (Prefix with 'apps.' because they are inside the 'apps' folder)
-    'apps.core_api',         # Shared logic/models if needed
-    'apps.control_api',      # API for controlling Docker services
-    # Add other apps here later ('apps.stt_api', 'apps.tts_api', etc.)
+    'apps.api',
+    'apps.core',
+    'apps.services',
+
+    # Feature Apps
+    'apps.features.journal',
+    'apps.features.uploader',
 ]
 
 MIDDLEWARE = [
@@ -220,3 +225,13 @@ if CORS_ALLOWED_ORIGINS:
     print(f"INFO: CORS Allowed Origins: {CORS_ALLOWED_ORIGINS}")
 # else:
 #     print(f"INFO: CORS Allow All Origins: {CORS_ALLOW_ALL_ORIGINS}")
+
+# Configure MEDIA settings for file uploads
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media' # Using modern pathlib syntax
+
+# Configure Celery and Celery Beat for scheduled tasks
+# Make sure your broker URL is set correctly (e.g., for Redis or RabbitMQ)
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
