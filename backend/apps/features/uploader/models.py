@@ -3,29 +3,43 @@ import os
 import uuid
 from django.db import models
 from django.utils import timezone
+from django.utils.text import slugify  # <--- 1. Import slugify
 from apps.core.models import TimeStampedModel
 
 
 def get_upload_path(instance, filename):
     """
-    Generates a highly scalable path for uploaded files:
-    MEDIA_ROOT/uploads/YYYY/MM/DD/uuid.ext
+    Generates a highly scalable and user-friendly path for uploaded files:
+    MEDIA_ROOT/uploads/YYYY/MM/DD/original-filename-shortid.ext
 
-    This function now relies on the persistent 'original_modified_at' field
-    of the model instance.
+    - Uses the original file's last modified date for the directory structure.
+    - Cleans the original filename to make it web-safe.
+    - Appends a short unique ID to prevent filename collisions.
     """
-    # Use the persistent 'original_modified_at' field. Fall back to now()
-    # if it's somehow not set when this function is called.
+    # Use the persistent 'original_modified_at' field. Fall back to now().
     base_date = instance.original_modified_at or timezone.now()
 
-    ext = os.path.splitext(filename)[1]
-    unique_filename = f"{uuid.uuid4()}{ext}"
+    # --- NEW FILENAME LOGIC ---
+    # 1. Get the filename parts
+    original_name, ext = os.path.splitext(filename)
 
-    # The path is now based on the original modified date
+    # 2. Clean the original name for web use
+    # E.g., "My Resume [final].pdf" -> "my-resume-final"
+    slugified_name = slugify(original_name)
+
+    # 3. Generate a short, unique identifier (first 8 chars of a UUID)
+    short_id = str(uuid.uuid4())[:8]
+
+    # 4. Combine the parts into a new, unique filename
+    # E.g., "my-resume-final-a1b2c3d4.pdf"
+    new_filename = f"{slugified_name}-{short_id}{ext}"
+    # --- END OF NEW LOGIC ---
+
+    # The path is now based on the original modified date and the new filename
     return os.path.join(
         'uploads',
         base_date.strftime('%Y/%m/%d'),
-        unique_filename
+        new_filename  # <--- Use the new, more descriptive filename
     )
 
 

@@ -9,5 +9,6 @@ urlpatterns = [
     # ... include other apps here
     # Include the generic container management API URLs
     path('containers/', include('apps.services.api.urls')),
+    path('stt/', include('apps.services.stt.urls', namespace='stt')),
 
 ]
