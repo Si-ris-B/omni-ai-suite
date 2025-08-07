@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Card, Row, Col, Typography, Spin, Tag, Switch, Avatar, message, Statistic, Alert } from 'antd';
 import { HddOutlined, PoweroffOutlined, CheckCircleOutlined } from '@ant-design/icons';
 import containerService from "../../../services/containerService.js";
+import WhisperModelInfo from '../../../components/speech-to-text/WhisperModelInfo.jsx';
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -142,6 +143,9 @@ function SystemStatus() {
                          <Statistic title="Image" value={container.image?.split('@')[0] || 'N/A'} />
                     </Col>
                 </Row>
+            </Card>
+            <Card>
+                <WhisperModelInfo />
             </Card>
         </Card>
     );
