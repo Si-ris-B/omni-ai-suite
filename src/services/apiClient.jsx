@@ -1,10 +1,12 @@
 // FILE: src/services/apiClient.jsx
 
 import axios from 'axios';
-import { message } from 'antd';
-import React from 'react';
+// --- CHANGED: Import toast and ToastContainer from react-toastify ---
+import { toast, ToastContainer, Zoom } from 'react-toastify';
+import 'react-toastify/dist/ReactToastify.css'; // Import the default CSS
+import React from 'react'; // Ensure React is imported if needed elsewhere or for JSX
 
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://192.168.1.17:8000';
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const apiClient = axios.create({
   baseURL: BASE_URL,
@@ -32,56 +34,56 @@ const extractErrorMessage = (error) => {
   return error.message || 'An unexpected error occurred.';
 };
 
-
 // --- RESPONSE INTERCEPTOR ---
-// This function runs for every successful API response (status 2xx)
 apiClient.interceptors.response.use(
   (response) => {
-    // --- THIS IS THE FIX for SUCCESS messages ---
-
-    // Only show a toast for methods that modify data.
-    // GET requests shouldn't pop up a success message every time.
+    // --- CHANGED: Using react-toastify for SUCCESS messages ---
     const method = response.config.method.toLowerCase();
     if (method === 'post' || method === 'put' || method === 'patch' || method === 'delete') {
-
       const responseDataString = JSON.stringify(response.data, null, 2);
 
-      const content = (
+      // Use toast.success for success messages
+      // You can customize appearance using options
+      toast.success(
         <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
           {responseDataString}
-        </pre>
+        </pre>,
+        {
+          position: "top-center",
+          autoClose: 5000,
+          hideProgressBar: false,
+          closeOnClick: false,
+          pauseOnHover: true,
+          draggable: true,
+          transition: Zoom,}
       );
-
-      message.success({
-        content: content,
-        duration: 5, // Display for 5 seconds
-        closable: true, // IMPORTANT: This adds the close button
-        style: {
-          marginTop: '20vh',
-          maxWidth: '80vw',
-        },
-      });
     }
-    // --- END OF FIX ---
+    // --- END OF CHANGE for SUCCESS ---
 
     return response;
   },
   (error) => {
-    // --- THIS IS THE FIX for ERROR messages ---
+    // --- CHANGED: Using react-toastify for ERROR messages ---
     const errorMessage = extractErrorMessage(error);
 
-    message.error({
-      content: errorMessage,
-      duration: 10, // Errors can stay a bit longer
-      closable: true, // IMPORTANT: This adds the close button
-      style: {
-        marginTop: '20vh',
-      },
+    // Use toast.error for error messages
+    toast.error(errorMessage, {
+      position: "top-center",
+      autoClose: 5000,
+      hideProgressBar: false,
+      closeOnClick: false,
+      pauseOnHover: true,
+      draggable: true,
+      transition: Zoom,
+       // Style adjustments can be made via CSS classes or ToastContainer
     });
-    // --- END OF FIX ---
+    // --- END OF CHANGE for ERROR ---
 
     return Promise.reject(error);
   }
 );
 
+// --- IMPORTANT: Export ToastContainer ---
+// You need to render this component in your app's root (e.g., App.jsx)
+export { ToastContainer };
 export default apiClient;

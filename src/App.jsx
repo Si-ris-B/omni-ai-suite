@@ -7,6 +7,9 @@ import { appConfig } from './config/appConfig.jsx';
 import MainLayout from '../src/components/MainLayout.jsx';
 import { Suspense } from 'react';
 
+import { ToastContainer } from 'react-toastify';
+import 'react-toastify/dist/ReactToastify.css';
+
 // A simple loading component. You can make this a fancy spinner.
 const LoadingFallback = () => (
   <div style={{ textAlign: 'center', padding: '50px' }}>
@@ -41,6 +44,22 @@ const generateRoutes = (config) => {
 function App() {
   return (
     <div className="App">
+      {/* --- Render ToastContainer here, outside Suspense --- */}
+      <ToastContainer
+        position="top-right"
+        autoClose={5000}
+        hideProgressBar={false}
+        newestOnTop={false}
+        closeOnClick
+        rtl={false}
+        pauseOnFocusLoss
+        draggable
+        pauseOnHover
+        theme="light"
+        // You can add style or className here for global container styling
+        // style={{ marginTop: '20vh' }} // Example matching your previous antd style
+      />
+      {/* --- --- --- */}
       <MainLayout>
         {/* 2. Wrap your Switch with Suspense */}
         <Suspense fallback={<LoadingFallback />}>
