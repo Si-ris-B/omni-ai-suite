@@ -14,6 +14,7 @@ import {
 const Dashboard = lazy(() => import('../pages/Dashboard'));
 const Journal = lazy(() => import('../pages/Journal'));
 const EditorDemo = lazy(() => import('../pages/Editor')); // Renamed for clarity
+const YoutubeDemo = lazy(() => import('../pages/youtube-transcription/YouTubeTranscriptPro'));
 
 // Now, your configuration array is incredibly clean and readable.
 export const appConfig = [
@@ -32,6 +33,22 @@ export const appConfig = [
     label: 'Journal',
     icon: <BookOutlined />,
     type: 'item',
+  },
+  {
+    key: 'stt',
+    label: 'Speech To Text',
+    icon: <TeamOutlined />,
+    type: 'group',
+    children: [
+      {
+        key: '/management/editor-demo',
+        path: '/management/editor-demo',
+        component: YoutubeDemo,
+        label: 'YouTube',
+        icon: <CodeOutlined />,
+        type: 'item',
+      }
+      ]
   },
   {
     key: 'management',
