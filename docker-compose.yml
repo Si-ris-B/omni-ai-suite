@@ -70,10 +70,10 @@ services:
       db: # Wait for DB to be healthy
         condition: service_healthy
       # No explicit depends_on stt_service needed if backend handles its status via API
-    restart: unless-stopped # Keep the backend controller running
-    expose:
-      # Expose backend port only within the Docker network (Nginx proxies to this)
-      - "${BACKEND_SERVICE_PORT:-8000}" # Use port from .env or default
+    ports:
+      # Map to host for easier development access
+      - "${BACKEND_SERVICE_PORT:-8000}:8000"
+    restart: unless-stopped
 
   # --- AI Service (STT - FastAPI) ---
   stt_service:

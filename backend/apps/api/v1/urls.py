@@ -10,5 +10,5 @@ urlpatterns = [
     # Include the generic container management API URLs
     path('containers/', include('apps.services.api.urls')),
     path('stt/', include('apps.services.stt.urls', namespace='stt')),
-
+    path('youtube/', include('apps.features.youtube.api.urls')),
 ]

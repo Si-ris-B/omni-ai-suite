@@ -1,0 +1,75 @@
+# File: docker-compose.dev.yml (For Local Development)
+version: '3.8'
+
+services:
+  # --- Database Service (PostgreSQL) ---
+  db:
+    image: postgres:15-alpine
+    container_name: omnicore_db_dev # Specific dev name
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data/ # Use a separate dev volume
+    env_file:
+      - .env # Load DB credentials from .env
+    ports:
+      # === CRITICAL: Map port 5432 to host for local Django connection ===
+      - "5432:5432"
+    networks:
+      - app-network-dev # Use a dev network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Database Admin Tool (PgAdmin) ---
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: omnicore_pgadmin_dev
+    env_file:
+      - .env # Load PGADMIN_DEFAULT_EMAIL/PASSWORD
+    ports:
+      # Map host port 5051 (different from prod maybe) to container port 80
+      - "5051:80"
+    volumes:
+      - pgadmin_data_dev:/var/lib/pgadmin
+    networks:
+      - app-network-dev
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- AI Service (STT - FastAPI) ---
+  # This runs in Docker, controlled by local Django
+  stt_service:
+    build:
+      context: ./ai_services/stt_service
+      dockerfile: Dockerfile
+    container_name: ${STT_CONTAINER_NAME:-omnicore_stt_service_container_dev} # Use dev name
+    # No command here - started via API
+    volumes:
+      # Mount local code for easier testing IF you want changes reflected without rebuild
+      # Comment out if you only want to run the built image version
+      - ./ai_services/stt_service:/app
+    env_file:
+      - .env
+    networks:
+      - app-network-dev
+    restart: "no" # Explicit start/stop via API
+    stop_grace_period: 15s
+    expose:
+      # Expose port only within Docker network (not needed on host)
+      - "${STT_SERVICE_PORT:-8001}"
+
+# --- Networks ---
+networks:
+  app-network-dev:
+    driver: bridge
+
+# --- Volumes ---
+volumes:
+  postgres_data_dev:
+    driver: local
+  pgadmin_data_dev:
+    driver: local

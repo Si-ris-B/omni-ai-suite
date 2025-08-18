@@ -65,6 +65,7 @@ INSTALLED_APPS = [
     # Feature Apps
     'apps.features.journal',
     'apps.features.uploader',
+    'apps.features.youtube'
 ]
 
 MIDDLEWARE = [

@@ -1,24 +1,22 @@
-// File: frontend/src/main.jsx
-import React from 'react';
-import ReactDOM from 'react-dom/client'; // Use client import for React 18+
-import App from './App';
-// Optional: If you have global CSS not handled by Chakra, import it here
-// import './index.css';
+/*!
+=========================================================
+* Muse Ant Design Dashboard - v1.0.0
+=========================================================
+* Product Page: https://www.creative-tim.com/product/muse-ant-design-dashboard
+* Copyright 2021 Creative Tim (https://www.creative-tim.com)
+* Licensed under MIT (https://github.com/creativetimofficial/muse-ant-design-dashboard/blob/main/LICENSE.md)
+* Coded by Creative Tim
+=========================================================
+* The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+*/
+import React from "react";
+import ReactDOM from "react-dom";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App";
 
-// Find the root element in your index.html
-const rootElement = document.getElementById('root');
-
-// Ensure the root element exists before trying to render
-if (rootElement) {
-    // Create a root instance
-    const root = ReactDOM.createRoot(rootElement);
-    // Render the App component within StrictMode for development checks
-    root.render(
-        <React.StrictMode>
-            <App />
-        </React.StrictMode>,
-    );
-} else {
-    // Log an error if the root element is missing
-    console.error("Fatal Error: Root element with id 'root' not found in index.html. React app cannot be mounted.");
-}
+ReactDOM.render(
+    <BrowserRouter>
+        <App />
+    </BrowserRouter>,
+    document.getElementById("root"),
+);
