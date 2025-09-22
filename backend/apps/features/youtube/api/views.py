@@ -3,10 +3,14 @@ import logging
 import os
 import tempfile
 import pysrt
+from django.core import serializers
 from rest_framework import status, views
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
+
 import yt_dlp
+
+from apps.features.youtube.services import prepare_audio_from_youtube
 
 logger = logging.getLogger(__name__)
 
@@ -317,3 +321,21 @@ class YoutubeTranscribeView(views.APIView):
         content = "\n".join(srt_lines)
         logger.info(f"Generated SRT content with {len(srt_lines)} lines")
         return content
+
+
+class YoutubePrepareAudioView(views.APIView):
+    """
+    HELPER ENDPOINT: Downloads audio from YouTube and returns its file details.
+    This is used by the frontend to stage the media and display a waveform
+    BEFORE the main transcription process is initiated.
+    """
+    permission_classes = [AllowAny]
+    def post(self, request, *args, **kwargs):
+        url = request.data.get('url')
+        if not url:
+            return Response({'error': 'URL is required'}, status=400)
+        try:
+            file_details = prepare_audio_from_youtube(url)
+            return Response(file_details, status=201)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)

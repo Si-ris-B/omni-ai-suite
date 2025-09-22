@@ -1,19 +1,20 @@
 import json
 
-from django.http import StreamingHttpResponse, JsonResponse
-from rest_framework import views, permissions, status
+from django.http import JsonResponse
+from rest_framework import views, permissions, status, parsers
 from rest_framework.response import Response
 from .client import STTServiceClient
-from .formatters import to_srt, to_txt
-from .serializers import TranscriptionRequestSerializer
+# Import new serializer and services
+from .serializers import TranscriptionRequestSerializer, ProcessRequestSerializer
 from apps.features.uploader.models import UploadedFile
+from apps.features.uploader.services import create_uploaded_file_from_request
+from apps.features.youtube.services import get_youtube_transcript, YouTubeProcessingError
+from apps.services.stt.services import transcribe_file
 from apps.services.models import ExternalService
 import logging
 
 logger = logging.getLogger(__name__)
 
-
-# The dynamic factory is no longer needed for the primary user workflow.
 
 class STTServiceBaseView(views.APIView):
     permission_classes = [permissions.AllowAny]
@@ -34,57 +35,21 @@ class TranscribeView(views.APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request, *args, **kwargs):
-        # NOTE: The front-end needs to send `format` in the request body
-        # e.g. { "file_id": 123, "format": "srt" }
         serializer = TranscriptionRequestSerializer(data=request.data)
         if not serializer.is_valid():
-            # Use DRF's default error response
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         validated_data = serializer.validated_data
         file_id = validated_data.get('file_id')
-        # This will require a 'format' field in your TranscriptionRequestSerializer.
-        # If it's not there, you can get it from request.data.get('format', 'srt')
-        # For now, let's assume it's in the request data but not the serializer for simplicity.
         output_format = request.data.get('format', 'srt')
-
 
         try:
             uploaded_file = UploadedFile.objects.get(pk=file_id)
-            if uploaded_file.file_type != 'audio':
-                return JsonResponse({"error": "Only audio files can be transcribed."}, status=status.HTTP_400_BAD_REQUEST)
+            if uploaded_file.file_type not in ['audio', 'video']:
+                return JsonResponse({"error": "Only audio and video files can be transcribed."}, status=status.HTTP_400_BAD_REQUEST)
 
-            client = STTServiceClient()
-            stream_generator = client.transcribe_file(uploaded_file)
-
-            segments = []
-            final_message_received = False
-            # FIX: The generator now yields strings, so we can iterate directly.
-            for line_str in stream_generator:
-                try:
-                    # Now we can safely parse the string.
-                    data = json.loads(line_str)
-                    if data.get('type') == 'segment':
-                        segments.append(data.get('data', {}))
-                    elif data.get('type') == 'final':
-                        final_message_received = True
-                        logger.info(f"Transcription complete for file {file_id}. Message: {data.get('message')}")
-                    elif data.get('type') == 'error':
-                        # The error from the downstream service is now handled cleanly.
-                        error_detail = data.get('message', 'Unknown transcription error from service')
-                        logger.error(f"Downstream transcription error for file {file_id}: {error_detail}")
-                        raise RuntimeError(error_detail)
-                except (json.JSONDecodeError, KeyError):
-                    logger.warning(f"Could not parse line from transcription stream: '{line_str}'")
-                    continue
-
-            if not final_message_received and not segments:
-                raise RuntimeError("Transcription stream ended prematurely with no segments or completion message.")
-
-            if output_format == 'txt':
-                formatted_content = to_txt(segments)
-            else:
-                formatted_content = to_srt(segments)
+            # This now uses the refactored service logic
+            formatted_content = transcribe_file(uploaded_file, output_format)
 
             return JsonResponse({"content": formatted_content}, status=status.HTTP_200_OK)
 
@@ -96,13 +61,6 @@ class TranscribeView(views.APIView):
                                 status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# The administrative views below are for direct management and debugging.
-# It is appropriate for them to require a specific machine_name.
-
-
-# The administrative views below are for direct management and debugging.
-# It is appropriate for them to require a specific machine_name.
-
 class STTStatusView(STTServiceBaseView):
     """
     Gets the status of the default STT service.
@@ -111,12 +69,11 @@ class STTStatusView(STTServiceBaseView):
 
     def get(self, request, service_name=None, *args, **kwargs):
         try:
-            # Re-implementing a simple factory here for admin purposes.
             if service_name:
                 service_config = ExternalService.objects.get(machine_name=service_name, service_type='stt')
-                client = STTServiceClient(service_config)  # Temporarily override default
+                client = STTServiceClient()  # This needs to be adapted if client accepts config
             else:
-                client = STTServiceClient()  # Use default
+                client = STTServiceClient()
 
             status_data = client.get_status()
             return Response(status_data, status=status.HTTP_200_OK)
@@ -132,7 +89,8 @@ class STTModelControlView(STTServiceBaseView):
     def post(self, request, service_name, action, *args, **kwargs):
         try:
             service_config = ExternalService.objects.get(machine_name=service_name, service_type='stt')
-            client = STTServiceClient(service_config)  # Override default
+            # This needs to be adapted if client accepts config
+            client = STTServiceClient()
 
             if action == 'load':
                 result = client.load_model()
@@ -144,3 +102,62 @@ class STTModelControlView(STTServiceBaseView):
             return Response(result, status=status.HTTP_200_OK)
         except Exception as e:
             return self.handle_exception(e)
+
+
+class STTProcessView(views.APIView):
+    """
+    A unified endpoint to process transcription requests from either
+    a file upload or a YouTube URL.
+    """
+    permission_classes = [permissions.AllowAny]
+    # We need multipart parser for file uploads.
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+
+    def post(self, request, *args, **kwargs):
+        # The serializer validates 'source_type', 'output_format', and 'url' if needed.
+        serializer = ProcessRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        validated_data = serializer.validated_data
+        source_type = validated_data['source_type']
+        output_format = validated_data['output_format']
+
+        try:
+            if source_type == 'upload':
+                # Handle file upload and transcription
+                logger.info("Processing transcription request from file upload.")
+                # 1. Create the UploadedFile instance from the request
+                uploaded_file = create_uploaded_file_from_request(request)
+                logger.info(f"File uploaded successfully. ID: {uploaded_file.id}")
+
+                # 2. Transcribe the file
+                content = transcribe_file(uploaded_file, output_format)
+
+                # 3. Return the result
+                return JsonResponse({"content": content, "file_id": uploaded_file.id}, status=status.HTTP_200_OK)
+
+            elif source_type == 'youtube':
+                # Handle YouTube URL transcription
+                url = validated_data['url']
+                logger.info(f"Processing transcription request from YouTube URL: {url}")
+
+                # 1. The service handles everything: download, upload, transcribe
+                content = get_youtube_transcript(url, output_format)
+
+                # 2. Return the result
+                return JsonResponse({"content": content}, status=status.HTTP_200_OK)
+
+        except (ValueError, FileNotFoundError) as e:
+            # Catches user errors from uploader service (missing data, etc.)
+            logger.warning(f"Bad request during transcription processing: {e}")
+            return JsonResponse({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except YouTubeProcessingError as e:
+            # Catches specific errors from the YouTube service
+            logger.error(f"YouTube processing failed: {e}", exc_info=True)
+            return JsonResponse({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            # Generic catch-all for other errors (e.g., from STT service)
+            logger.error(f"An unexpected error occurred in STTProcessView: {e}", exc_info=True)
+            return JsonResponse({"error": "An internal server error occurred. Please check the logs."},
+                                status=status.HTTP_500_INTERNAL_SERVER_ERROR)

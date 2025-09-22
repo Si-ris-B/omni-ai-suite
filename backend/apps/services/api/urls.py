@@ -1,6 +1,7 @@
 # apps/services/api/urls.py
 from django.urls import path
 from .views import ContainerControlView, ContainerStatusView, ContainerStatusStreamView
+from ..views import ExternalServiceListView
 
 urlpatterns = [
     # Endpoint for sending commands (start/stop)
@@ -10,4 +11,6 @@ urlpatterns = [
     path('<str:service_name>/status/', ContainerStatusView.as_view(), name='container-status'),
 # --- ADD THIS NEW URL PATTERN FOR THE STREAMING ENDPOINT ---
     path('<str:service_name>/status-stream/', ContainerStatusStreamView.as_view(), name='container-status-stream'),
+    path('services/', ExternalServiceListView.as_view(), name='external-services-list'),
+
 ]

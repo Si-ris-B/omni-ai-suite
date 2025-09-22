@@ -1,11 +1,15 @@
 from django.urls import path
-from .views import TranscribeView, STTStatusView, STTModelControlView
+from .views import TranscribeView, STTStatusView, STTModelControlView, STTProcessView
 
 app_name = 'stt'
 
 urlpatterns = [
-    # This is the primary, simple endpoint for all users of the API.
+    # This endpoint is specifically for transcribing an already uploaded file by its ID.
     path('transcribe/', TranscribeView.as_view(), name='transcribe'),
+
+    # This is the new, unified endpoint for starting a transcription job
+    # from either a file upload or a YouTube URL.
+    path('process/', STTProcessView.as_view(), name='process'),
 
     # --- Administrative / Debug Endpoints ---
     # These endpoints allow an admin to interact with specific services.
