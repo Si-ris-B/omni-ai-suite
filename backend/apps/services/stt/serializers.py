@@ -1,5 +1,27 @@
-from rest_framework import serializers
+# FILE: apps/services/stt/serializers.py
 
+from rest_framework import serializers
+from .models import STTModelSettings, STTTranscriptionSettings
+
+class STTModelSettingsSerializer(serializers.ModelSerializer):
+    """
+    Serializer for the STTModelSettings model.
+    """
+    class Meta:
+        model = STTModelSettings
+        fields = ['id', 'service', 'model_size_or_path', 'device', 'compute_type', 'device_index', 'cpu_threads', 'num_workers']
+        read_only_fields = ['id', 'service']
+
+class STTTranscriptionSettingsSerializer(serializers.ModelSerializer):
+    """
+    Serializer for the global STTTranscriptionSettings singleton model.
+    """
+    class Meta:
+        model = STTTranscriptionSettings
+        fields = '__all__'
+
+
+# --- Keep existing serializers ---
 class TranscriptionRequestSerializer(serializers.Serializer):
     """
     Validates the simple request to transcribe a file.
